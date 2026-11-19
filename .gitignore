@@ -1,5 +1,4 @@
 # --- Private (never commit) ---
-WORKLOG.md
 .claude/settings.local.json
 .env
 *.token

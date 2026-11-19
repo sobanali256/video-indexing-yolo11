@@ -1,9 +1,9 @@
 # CLAUDE.md — Video Indexing at Speed (YOLO11l take-home)
 
 ## Start of every session
-1. Read `WORKLOG.md` (private, gitignored). It holds pending/completed work, open/closed issues and where the last session stopped.
+1. Read `worklog/WORKLOG.md` (committed to the repo, so never put secrets in it). It holds pending/completed work, open/closed issues and where the last session stopped.
 2. Pick up from its **Next up** section. If unsure what to do next, ask the user.
-3. Update `WORKLOG.md` before ending a session or after any milestone (dated entries, absolute dates).
+3. Update `worklog/WORKLOG.md` before ending a session or after any milestone (dated entries, absolute dates).
 
 ## Task (from the brief)
 `python run.py --input <folder of .parquet files> --output results.jsonl`
@@ -46,7 +46,7 @@ RTX 4090 24 GB, 32 CPU threads, 64 GB RAM, Ubuntu 22.04, **Python 3.11**, CUDA 1
 ## HARD RULES
 - **Never write, draft, rewrite or check answers in `WRITEUP.md`.** The brief requires the user's own words, without AI. Claude may only create the empty question headings if asked.
 - **Never commit secrets.** No HF tokens in code, notebooks, or outputs. Scan before every push (`git grep -nE "hf_[A-Za-z0-9]{20,}"`).
-- **Never commit `WORKLOG.md`**, data, weights, or raw `results.jsonl` (only `results.jsonl.gz`).
+- **Never commit** data, weights, or raw `results.jsonl` (only `results.jsonl.gz`). `worklog/WORKLOG.md` IS committed: keep secrets and tokens out of it.
 - Correctness first: every speed change must be validated against a brute-force reference on a sample before it's accepted.
 - When anything is ambiguous, **ask the user**.
 
@@ -55,7 +55,7 @@ RTX 4090 24 GB, 32 CPU threads, 64 GB RAM, Ubuntu 22.04, **Python 3.11**, CUDA 1
 2. **Independent verification** of the plan by a separate subagent (fresh context) before execution.
 3. **Execution with Sonnet** (user switches with `/model`; `opusplan` is not available).
 4. **After every major change, run `/code-review`** and fix findings before moving on.
-5. Log the outcome in `WORKLOG.md`. Commit only when the user asks.
+5. Log the outcome in `worklog/WORKLOG.md`. Commit only when the user asks.
 
 ## Inference backend (TensorRT deferred)
 - **Now:** correct baseline with plain `yolo11l.pt` on PyTorch, then batching / pipelining / sampling / FP16.
