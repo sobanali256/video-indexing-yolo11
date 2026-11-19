@@ -6,6 +6,8 @@ import os
 import sys
 from pathlib import Path
 
+import vidx  # noqa: F401  (sanitises MPLBACKEND before Ultralytics is imported)
+
 HERE = Path(__file__).resolve().parent
 WEIGHTS = HERE / "yolo11l.pt"
 

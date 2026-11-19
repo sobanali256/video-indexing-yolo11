@@ -1,18 +1,18 @@
-# Colab L4 setup (VS Code Colab extension)
+# Colab L4 setup (colab.research.google.com)
 
 The ready-made notebook `colab/baseline.ipynb` contains every step below as cells.
 
-How the extension works: you open a notebook in VS Code and pick a Colab server as its kernel; cells run on
-Google's VM, not on your machine. Local files are **not** synced, so the code reaches Colab via `git clone`.
+Open it in the browser: `https://colab.research.google.com/github/sobanali256/video-indexing-yolo11/blob/main/colab/baseline.ipynb`
+(or File → Open notebook → GitHub). Save a copy to Drive if you want to keep cell outputs. The code reaches the VM
+via `git clone` (the VS Code Colab extension was unreliable, so we use the website).
 Shell commands go in cells as `!cmd` or `%%bash`. Every `!` line is a fresh shell, so `source activate` does
 not persist; always call the venv tools by full path (`/content/venv/bin/python`, `/content/venv/bin/hf`).
-Keep VS Code open and the machine awake during long runs. A runtime reset wipes `/content`.
+Keep the browser tab open during long runs. A runtime reset wipes `/content`.
 
 Never paste the HF token into a file or a saved cell: use a Colab Secret named `HF_TOKEN`, or the `getpass` prompt.
 
 ## 1. Connect and check the machine
-VS Code: install the "Google Colab" extension, open `colab/baseline.ipynb`, **Select Kernel → Colab → New Colab
-Server → GPU → L4**, sign in with the Colab Pro account.
+**Runtime → Change runtime type → L4 GPU**, then Connect (Colab Pro account).
 ```
 !nvidia-smi; df -h /content; free -h; nproc; lscpu | grep "Model name"; python3 --version
 ```
@@ -30,7 +30,7 @@ pip install -q uv
 cd video-indexing-yolo11 && git pull
 apt-get install -y -q libgl1 libglib2.0-0
 uv pip install --python /content/venv/bin/python -r requirements.txt
-/content/venv/bin/python -c "import torch,av,ultralytics;print(torch.__version__,torch.cuda.is_available(),av.__version__,ultralytics.__version__)"
+/content/venv/bin/python -c "import vidx,torch,av,ultralytics;print(torch.__version__,torch.cuda.is_available(),av.__version__,ultralytics.__version__)"
 /content/venv/bin/python prepare.py
 ```
 If a pin fails to resolve, fix it in `requirements.txt` and log it in `worklog/WORKLOG.md`.
@@ -52,7 +52,7 @@ The token is cached on the VM (`~/.cache/huggingface`), outside the repo; the ve
 from google.colab import drive
 drive.mount("/content/drive")
 ```
-`DRIVE=/content/drive/MyDrive/vidx` below. If the mount fails through the extension: create a **private** dataset repo
+`DRIVE=/content/drive/MyDrive/vidx` below. If the mount fails: create a **private** dataset repo
 on huggingface.co (token needs write access) and replace `--checkpoint-dir …` with `--checkpoint-hf-repo YOURNAME/vidx-ckpt`;
 `--dump-frames` can then stay on local disk and the npz files are uploaded to `<run-name>/frames/`.
 
