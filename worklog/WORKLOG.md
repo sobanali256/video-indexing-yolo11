@@ -3,7 +3,8 @@
 Deadline: **Sun 22 Nov 2026, 23:55 PKT**
 
 ## Next up
-1. User: `/code-review` the 2026-11-20 changes (stats-json, score.py multi-reference, bench.py, tools/count_frames.py), fix findings, then commit and push (scan for secrets first).
+0. **Where we stopped (2026-11-20):** Colab (website, not the VS Code extension — it was buggy) session reached step 11 "Checks"; the cell had been running > 30 min. Collect from the user: the `bench_log.csv` "brute force baseline" row, machine check output, and whatever the checks cell printed. Then investigate the slow checks (open issue #8).
+1. (done) code review of 2026-11-20 changes; commits 4009eeb, 17a55b9 (MPLBACKEND fix, Colab website), f3e3b60 (single `--include` for the 3 reference files).
 2. Colab L4, run order in `colab/baseline.ipynb` / `colab/SETUP.md` (Drive = `/content/drive/MyDrive/vidx`):
    1. machine check, py3.11 venv + install + `prepare.py`, HF login, Drive mount
    2. download only the 3 reference files (00000, 00024, 00049); symlinks into `/content/subset/{,tune,holdout}`
@@ -18,7 +19,7 @@ Deadline: **Sun 22 Nov 2026, 23:55 PKT**
 
 ## Pending
 - [ ] HF access + token (Colab Secret)
-- [ ] Colab: confirm Drive mount via VS Code extension, else create private HF dataset repo and use `--checkpoint-hf-repo`; then reset the runtime mid-subset-run and resume from the checkpoint
+- [ ] Colab (website): confirm Drive mount works; then reset the runtime mid-run and resume from the checkpoint
 - [ ] Colab L4 environment verified (GPU, disk, Python/CUDA versions)
 - [ ] Download 50 parquet files to Colab
 - [ ] Verify `requirements.txt` pins in a fresh Python 3.11 venv (PROVISIONAL: torch 2.6.0/cu126, torchvision 0.21.0, ultralytics 8.3.100, av 14.2.0, pyarrow 19.0.1, numpy 1.26.4, opencv-python 4.10.0.84)
@@ -72,6 +73,9 @@ Deadline: **Sun 22 Nov 2026, 23:55 PKT**
   - The final snapshot always makes a new generation, even if nothing changed. Time lost after a crashed session's last snapshot is not in `compute_s`.
   - A half-written dump is only protected from partial reads, not cleaned up at start; `*.tmp.npz` files are ignored by the HF uploader.
   - SIGTERM handler is `sys.exit(143)`, installed only with a checkpoint flag. Windows `.venv` runs Python 3.14, so the tests have not run on 3.11.
+
+- #8 (2026-11-20) Colab step 11 "Checks" ran > 30 min. Likely cause (unverified): `tools/decoder_agreement.py --n 20` runs YOLO on **every frame of 20 whole videos twice** (PyAV and cv2), i.e. roughly a brute-force run on ~40 video-passes; `batch_agreement` (1000 frames × 3 passes) is small. Also a `%%bash` cell shows output only when it ends, so progress is invisible. To do: confirm with `ps`/`nvidia-smi`, cap decoder_agreement to N seconds or frames per video, run each check in its own cell / with progress output.
+- #9 (2026-11-20) Colab facts learned: Colab kernel Python is 3.13 (venv is uv-managed 3.11.18); notebook kernel exports `MPLBACKEND=module://matplotlib_inline...` which breaks Ultralytics in subprocesses (fixed in `vidx/__init__.py`); repeated `hf download --include` flags appeared to keep only the last pattern (fixed: one `--include` with 3 patterns; cause not verified with `ls`). requirements.txt pins installed cleanly on py3.11 (54 packages, torch 2.6.0+cu126) — pins verified for install; runtime not yet verified.
 
 ## Deferred
 - #3 (2026-11-19) **Deferred, design noted.** TensorRT: L4 dev vs RTX 4090 grader, engine must be built in grader prep step. Rules recorded in CLAUDE.md "Inference backend". Baseline first with PyTorch .pt; model behind load_model()/infer(batch).
