@@ -66,7 +66,7 @@ count of all 50 files, and an extrapolation (step 12). `--limit-videos` is not u
 
 ## 6. Data: only the 3 reference files first
 ```
-!/content/venv/bin/hf download HuggingFaceFV/finevideo --repo-type dataset --include "data/train-00000-*" --include "data/train-00024-*" --include "data/train-00049-*" --local-dir /content/finevideo
+!/content/venv/bin/hf download HuggingFaceFV/finevideo --repo-type dataset --include "data/train-00000-*" "data/train-00024-*" "data/train-00049-*" --local-dir /content/finevideo
 ```
 Symlinks keep the original file names, so video ids (`<parquet name>:<row>`) do not change:
 ```
