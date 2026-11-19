@@ -379,6 +379,76 @@ class CheckpointMainTest(unittest.TestCase):
             self.assertEqual(np.load(Path(d) / final.name)["counts"].tolist(), [[1, 0, 0, 0, 0]])
 
 
+class StatsJsonTest(unittest.TestCase):
+    KEYS = {"videos", "errors", "frames", "decode_s", "infer_s", "aggregate_s", "loop_s", "startup_s",
+            "exit_code", "argv"}
+
+    def stats(self, fr, name="s.json"):
+        return json.loads((fr.root / name).read_text(encoding="utf-8"))
+
+    def test_keys_present_after_normal_run(self):
+        with FakeRun(n_videos=3) as fr:
+            path = str(fr.root / "s.json")
+            self.assertEqual(fr.main("r.jsonl", "--stats-json", path), 0)
+            d = self.stats(fr)
+        self.assertEqual(set(d), self.KEYS)
+        self.assertEqual((d["videos"], d["errors"], d["exit_code"]), (3, 0, 0))
+        self.assertGreater(d["frames"], 0)
+        self.assertGreaterEqual(d["loop_s"], 0)
+        self.assertGreaterEqual(d["startup_s"], 0)
+        self.assertIn("--stats-json", d["argv"])
+
+    def test_written_when_run_aborts(self):
+        with FakeRun(n_videos=6, bad_infer=True) as fr:
+            path = str(fr.root / "s.json")
+            self.assertEqual(fr.main("r.jsonl", "--stats-json", path), 3)
+            d = self.stats(fr)
+        self.assertEqual(set(d), self.KEYS)
+        self.assertEqual(d["exit_code"], 3)
+        self.assertIsNotNone(d["loop_s"])
+
+    def test_written_when_run_is_interrupted(self):
+        with FakeRun(n_videos=6, crash_after=2) as fr:
+            path = str(fr.root / "s.json")
+            with self.assertRaises(KeyboardInterrupt):
+                fr.main("r.jsonl", "--stats-json", path)
+            d = self.stats(fr)
+        self.assertEqual(set(d), self.KEYS)
+        self.assertEqual(d["videos"], 2)
+        self.assertEqual(d["exit_code"], 1)
+
+    def test_written_on_early_exit(self):
+        with FakeRun() as fr:
+            for p in (fr.root / "in").glob("*.parquet"):
+                p.unlink()
+            path = str(fr.root / "s.json")
+            self.assertEqual(fr.main("r.jsonl", "--stats-json", path), 2)
+            d = self.stats(fr)
+        self.assertEqual((d["exit_code"], d["videos"], d["loop_s"]), (2, 0, None))
+
+    def test_sigterm_handler_installed_with_stats_json_only(self):
+        import signal
+
+        old = signal.getsignal(signal.SIGTERM)
+        try:
+            with FakeRun(n_videos=1) as fr:
+                self.assertEqual(fr.main("r.jsonl"), 0)
+                self.assertIs(signal.getsignal(signal.SIGTERM), old)  # plain command: untouched
+                self.assertEqual(fr.main("r2.jsonl", "--stats-json", str(fr.root / "s.json")), 0)
+                handler = signal.getsignal(signal.SIGTERM)
+                self.assertIsNot(handler, old)
+                with self.assertRaises(SystemExit) as cm:
+                    handler(signal.SIGTERM, None)
+                self.assertEqual(cm.exception.code, 128 + signal.SIGTERM)
+        finally:
+            signal.signal(signal.SIGTERM, old)
+
+    def test_off_by_default(self):
+        with FakeRun() as fr:
+            self.assertEqual(fr.main("r.jsonl"), 0)
+            self.assertEqual(sorted(p.name for p in fr.root.iterdir()), ["in", "r.jsonl", "r.jsonl.done"])
+
+
 class SummarizeTest(unittest.TestCase):
     def test_summarize(self):
         counts, best = summarize([0, 0, 2, 67, 5], [0.5, 0.9, 0.6, 0.41, 0.99])

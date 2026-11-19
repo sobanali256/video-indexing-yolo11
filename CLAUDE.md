@@ -48,6 +48,7 @@ RTX 4090 24 GB, 32 CPU threads, 64 GB RAM, Ubuntu 22.04, **Python 3.11**, CUDA 1
 - **Never commit secrets.** No HF tokens in code, notebooks, or outputs. Scan before every push (`git grep -nE "hf_[A-Za-z0-9]{20,}"`).
 - **Never commit** data, weights, or raw `results.jsonl` (only `results.jsonl.gz`). `worklog/WORKLOG.md` IS committed: keep secrets and tokens out of it.
 - Correctness first: every speed change must be validated against a brute-force reference on a sample before it's accepted.
+- **Tune only on `train-00000`.** `train-00024` and `train-00049` are held out: scored only, never used to choose parameters.
 - When anything is ambiguous, **ask the user**.
 
 ## Workflow (agreed with user)

@@ -3,11 +3,18 @@
 Deadline: **Sun 22 Nov 2026, 23:55 PKT**
 
 ## Next up
-1. User: review the code written on 2026-11-19, then `/code-review` it and fix findings.
-2. User: push the setup commit `c63d7cd` (it has not reached GitHub; push from a terminal where the credential prompt works).
-3. Colab L4 (see `colab/SETUP.md`): py3.11 venv, `pip install -r requirements.txt` (pins are provisional), `python prepare.py`, HF login via Colab Secret, download 2 parquet files, then the full 50 in the background.
-4. Colab: baseline on the subset with `--dump-frames` -> `reference/ref_subset.jsonl`; record fps and stage timings; run the checks listed under Pending.
-5. Then speed-up planning (sampling, decode speed, batching, FP16, pipelining, maybe TensorRT), each validated with `score.py` against the reference.
+1. User: `/code-review` the 2026-11-20 changes (stats-json, score.py multi-reference, bench.py, tools/count_frames.py), fix findings, then commit and push (scan for secrets first).
+2. Colab L4, run order in `colab/baseline.ipynb` / `colab/SETUP.md` (Drive = `/content/drive/MyDrive/vidx`):
+   1. machine check, py3.11 venv + install + `prepare.py`, HF login, Drive mount
+   2. download only the 3 reference files (00000, 00024, 00049); symlinks into `/content/subset/{,tune,holdout}`
+   3. clean timing run on the tune file with `bench.py run --label "brute force baseline"` (no download, nothing else on the GPU; one uninterrupted run); output = `ref_tune.jsonl`
+   4. start the 50-file background download into the same `--local-dir`
+   5. tune dump run (`--dump-frames`, checkpoints on Drive) + determinism check vs `ref_tune.jsonl`
+   6. holdout reference run (no dumps)
+   7. checks (schema, self-scores, rotation, decoder/batch agreement), copy references to `$DRIVE/reference/`
+   8. after the download: `tools/count_frames.py` on all 50 files and `--compare-dumps` on the tune file, then `bench.py extrapolate`
+3. Copy `bench_log.csv` into the repo as evidence for the write-up (user writes WRITEUP.md).
+4. Then speed-up planning (sampling, decode speed, batching, FP16, pipelining, maybe TensorRT): tune on `train-00000` only, validate each change on holdout with `score.py --ref tune=... --ref holdout=...`.
 
 ## Pending
 - [ ] HF access + token (Colab Secret)
@@ -34,6 +41,7 @@ Deadline: **Sun 22 Nov 2026, 23:55 PKT**
 - [ ] Final secret scan + push before deadline
 
 ## Completed
+- 2026-11-20: Reference-set change (plan "Tune/holdout reference sets, clean timing, frame count and extrapolation"). Decision: the brute-force reference is now 3 parquet files spread over the dataset; **tune = train-00000** (all tuning), **holdout = train-00024 + train-00049** (scored only, never tuned on; rule added to CLAUDE.md). Brute force is not run on all 50 files (projected 25+ h): a clean timing on the tune file + a model-free frame count of all 50 files + extrapolation instead. Code: `run.py --stats-json PATH` (opt-in, written in `finally`: videos, errors, frames, decode_s, infer_s, aggregate_s, loop_s, startup_s, exit_code, argv; grader command unchanged); `score.py` multi-reference (`--ref NAME=PATH`, per-reference file set from second + error lines, candidate filtered to it, empty reference = FAIL, `--only-common` = PARTIAL, `--json`; positional form kept); new `bench.py` (`run` = timed subprocess + scoring + CSV row, clean detection via /proc download scan and nvidia-smi foreign GPU pids every 30 s; `extrapolate` = fixed + frames x per-frame from the newest clean ok row); new `tools/count_frames.py` (PyAV demux packet count, CSV, totals, `--compare-dumps`); `colab/baseline.ipynb` + `colab/SETUP.md` rewritten for the new run order. Tests: all pass (new `test_score_multi`, `test_bench`, `test_count_frames`, `StatsJsonTest` in `test_run`). Not run on Colab yet; `/code-review` pending.
 - 2026-11-19: Durable checkpoints for long Colab runs (new `vidx/checkpoint.py`, imported only when `--checkpoint-dir` / `--checkpoint-hf-repo` is given; plain `run.py --input --output` unchanged). Generation folders `gen-NNNN/` (gz output, done.txt, progress.json, manifest.json last with sizes + sha256 + run fingerprint), newest 2 kept, snapshot every `--checkpoint-minutes` (10) at a video boundary plus a final one in `finally` (SIGTERM mapped to exit); every snapshot failure only warns. `--resume` restores the newest valid generation if ahead of the local files; a fresh run over an existing checkpoint exits 2. Sidecar is now `video_id<TAB>line_count` (plain ids still read) and `_recover` redoes a video whose lines are incomplete. `--dump-frames` writes `<name>.tmp.npz` then `os.replace`. `huggingface_hub==0.29.3` pinned (provisional). Tests: `tests/test_checkpoint.py`, extended `test_output.py` / `test_run.py` (smoke test uses fake `iter_rows` + decode because `.venv` has no pyarrow). Not yet run on Colab; `/code-review` pending.
 - 2026-11-19: Housekeeping: worklog moved to `worklog/WORKLOG.md`, removed from `.gitignore`, CLAUDE.md paths and wording updated (worklog is now committed).
 - 2026-11-19: Wrote the baseline pipeline per plan: `run.py`, `prepare.py`, `score.py`, `vidx/{source,decode,model,aggregate,output}.py`, `tools/{find_rotated,decoder_agreement,batch_agreement,check_schema}.py`, `tests/` (CPU, stdlib unittest), `requirements.txt` (provisional pins), `colab/SETUP.md`, README install/prepare/run.
@@ -97,3 +105,13 @@ Deadline: **Sun 22 Nov 2026, 23:55 PKT**
 ## Session log
 - 2026-11-19: Session "Alethia": repo setup.
 - 2026-11-19: Execution session (Sonnet): housekeeping + local code per the approved plan (steps 1-2). Colab steps not started.
+- 2026-11-20: Code review #3 (bench/score/count_frames), fixes:
+  - bench: a scoring exception no longer prevents the CSV row (row logged with blank scores and the error, truncated, in notes; exit 1).
+  - bench: GPU-busy detection now scans `/proc/<pid>/fd` for open `/dev/nvidia*` fds outside bench's own process tree (reason `other GPU process pid=.. cmd=..`); no /proc -> clean "no", unknown. The nvidia-smi compute-apps check is gone (nvidia-smi is only used for the GPU name). The process tree is computed once per check and passed to both scanners.
+  - bench: a failed or PARTIAL `--ref` set gives status `fail_accuracy` and a non-zero exit (`failed` stays for a non-zero run.py exit); `extrapolate` only uses `status=ok` rows.
+  - colab notebook + SETUP.md: reset instructions now also say to re-download the 3 reference files, recreate the symlinks and restart the 50-file download if unfinished; the symlink cell uses `shopt -s failglob` plus an existence check so an unmatched glob fails loudly.
+  - tools/count_frames.py: per-file error handling (an error row per failing file, also for metadata access), BrokenProcessPool retries the unfinished files serially, the CSV is always written, error count printed.
+  - run.py: the SIGTERM->SystemExit handler is installed when `--stats-json` or a checkpoint flag is set (never for the plain grader command).
+  - score.py: the two-file positional mode no longer filters the candidate (extra candidate seconds are FP again); filtering stays in `--ref` mode with a loud WARNING for ignored candidate videos and an explicit message when the candidate shares no parquet file with a reference. `--only-common` with no overlapping videos reports "no overlapping videos between candidate and reference" (FAIL, not empty_reference).
+  - shared helpers: `vidx.source.list_inputs` (used by run.py and count_frames) and public `vidx.source.short_error` (was `_short`).
+  - tests added/adjusted in test_bench, test_score_multi, test_count_frames, test_run.

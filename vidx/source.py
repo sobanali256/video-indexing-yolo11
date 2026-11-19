@@ -4,6 +4,14 @@ import logging
 log = logging.getLogger("vidx.source")
 
 
+def list_inputs(src):
+    """Parquet files to process: [src] if src is a file, else the sorted *.parquet files of the folder."""
+    from pathlib import Path
+
+    src = Path(src)
+    return [src] if src.is_file() else sorted(src.glob("*.parquet"))
+
+
 def iter_rows(path):
     """Yield (video_id, data, error) for every row of one parquet file.
 
@@ -19,7 +27,7 @@ def iter_rows(path):
         n_groups = pf.metadata.num_row_groups
         names = pf.schema_arrow.names
     except Exception as e:
-        yield f"{name}:0", None, f"could not open parquet: {_short(e)}"
+        yield f"{name}:0", None, f"could not open parquet: {short_error(e)}"
         return
 
     index = 0  # global row counter across row groups
@@ -43,9 +51,9 @@ def iter_rows(path):
         except Exception as e:
             log.warning("%s row group %d unreadable after %d rows: %s", name, g, produced, e)
             for _ in range(rows_in_group - produced):
-                yield f"{name}:{index}", None, f"could not read row: {_short(e)}"
+                yield f"{name}:{index}", None, f"could not read row: {short_error(e)}"
                 index += 1
 
 
-def _short(e, limit=200):
+def short_error(e, limit=200):
     return f"{type(e).__name__}: {e}"[:limit]

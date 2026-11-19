@@ -6,6 +6,7 @@ Heavy dependencies (torch, ultralytics, av, cv2, pyarrow) are only imported
 where they are needed, so process_frames() can be tested with fakes.
 """
 import argparse
+import json
 import logging
 import os
 import signal
@@ -16,6 +17,7 @@ from typing import NamedTuple
 
 from vidx.aggregate import aggregate, error_line, make_lines
 
+_PROCESS_START = time.perf_counter()  # approximates process start: startup_s = imports + CUDA init + model load
 log = logging.getLogger("run")
 MAX_INFERENCE_FAILURES = 3
 
@@ -202,6 +204,8 @@ def parse_args(argv=None):
     ap.add_argument("--checkpoint-hf-repo", default=None, metavar="USER/REPO",
                     help="also snapshot progress into this private HF dataset repo")
     ap.add_argument("--run-name", default=None, help="checkpoint name (default: output file name)")
+    ap.add_argument("--stats-json", default=None, metavar="PATH",
+                    help="write timing stats (videos, frames, decode_s, infer_s, loop_s, startup_s, ...) here; off by default")
     ap.add_argument("--checkpoint-minutes", type=float, default=10, help="snapshot interval (default 10)")
     return ap.parse_args(argv)
 
@@ -230,17 +234,54 @@ def setup_checkpoint(args, files):
     return ckpt
 
 
+def write_stats(path, stats, timers, exit_code, argv):
+    """Write the --stats-json file. Never raises: a stats problem must not change the run's outcome."""
+    try:
+        d = {
+            "videos": timers.videos if timers else 0,
+            "errors": timers.errors if timers else 0,
+            "frames": timers.frames if timers else 0,
+            "decode_s": timers.decode if timers else 0.0,
+            "infer_s": timers.infer if timers else 0.0,
+            "aggregate_s": timers.aggregate if timers else 0.0,
+            "loop_s": stats.get("loop_s"),  # loop start -> loop end; None if the loop never started
+            "startup_s": stats.get("startup_s"),
+            "exit_code": exit_code,
+            "argv": list(argv),
+        }
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=2)
+    except Exception as e:
+        print(f"stats-json: could not write {path}: {e}", file=sys.stderr)
+
+
 def main(argv=None):
     args = parse_args(argv)
+    if not args.stats_json:
+        return _main(args, {})
+    stats = {}
+    exit_code = 1  # stays 1 if an exception escapes
+    try:
+        exit_code = _main(args, stats)
+        return exit_code
+    except SystemExit as e:
+        exit_code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+        raise
+    finally:
+        write_stats(args.stats_json, stats, stats.get("timers"), exit_code,
+                    sys.argv[1:] if argv is None else argv)
+
+
+def _main(args, stats):
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(asctime)s %(name)s %(message)s")
     from vidx.model import infer, load_model
     from vidx.output import OutputWriter, ResumeError
-    from vidx.source import iter_rows
+    from vidx.source import iter_rows, list_inputs
 
-    src = Path(args.input)
-    files = [src] if src.is_file() else sorted(src.glob("*.parquet"))
+    files = list_inputs(args.input)
     if not files:
-        print(f"no .parquet files found in {src}", file=sys.stderr)
+        print(f"no .parquet files found in {args.input}", file=sys.stderr)
         return 2
     ckpt = None
     if args.checkpoint_dir or args.checkpoint_hf_repo:
@@ -249,7 +290,9 @@ def main(argv=None):
         except Exception as e:
             print(f"checkpoint: {e}", file=sys.stderr)
             return 2
-        signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))  # run `finally` on SIGTERM
+    if args.stats_json or args.checkpoint_dir or args.checkpoint_hf_repo:
+        # run `finally` (stats / checkpoint) on SIGTERM; never for the plain grader command
+        signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
     try:
         model = load_model()
     except FileNotFoundError as e:
@@ -261,6 +304,7 @@ def main(argv=None):
         return infer(model, images)
 
     timers = Timers()
+    stats["timers"] = timers
     try:
         writer = OutputWriter(args.output, resume=args.resume)
     except ResumeError as e:
@@ -269,6 +313,7 @@ def main(argv=None):
     if args.resume:
         log.info("resuming: %d videos already done", len(writer.done))
     start = time.perf_counter()
+    stats["startup_s"] = start - _PROCESS_START
     seen = 0
     pending = []  # (video_id, message) of videos whose inference failed: written only once we know the model still works
 
@@ -320,6 +365,7 @@ def main(argv=None):
                     ckpt.maybe_snapshot(timers)
         write_pending()  # normal end: nothing followed them, record them as errors
     finally:
+        stats["loop_s"] = time.perf_counter() - start
         writer.close()
         if ckpt:
             ckpt.snapshot(timers)  # also on exit 3, an exception, KeyboardInterrupt or SIGTERM; never raises
