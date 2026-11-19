@@ -1,0 +1,2 @@
+# Share links for web AI chats (ChatGPT / Claude.ai / Gemini) used for this task, one per line.
+# Claude Code session logs (.jsonl) are copied into this folder unedited (tokens replaced with [REMOVED]).

@@ -1,0 +1,39 @@
+# --- Private (never commit) ---
+WORKLOG.md
+.claude/settings.local.json
+.env
+*.token
+hf_token*
+
+# Assignment brief (kept locally only)
+AI_Engineering_TakeHome_Brief.pdf
+
+# --- Data & models (too large / downloaded by prep step) ---
+finevideo/
+data/
+*.parquet
+*.mp4
+*.pt
+*.engine
+*.onnx
+*.torchscript
+
+# --- Outputs (only the gzipped final results are committed) ---
+results.jsonl
+*.jsonl.tmp
+runs/
+reference/
+bench/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+.pytest_cache/
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.vscode/
