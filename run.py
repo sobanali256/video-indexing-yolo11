@@ -22,8 +22,10 @@ log = logging.getLogger("run")
 MAX_INFERENCE_FAILURES = 3
 # Defaults of the grader command (`run.py --input --output`). They change only after a setting passed the
 # accuracy margin on tune AND holdout; the commit that produced results.jsonl.gz is tagged with them.
-DEFAULT_SAMPLE = 0  # frames per second sent to the model; 0 = every frame (brute force)
-DEFAULT_PRECISION = "fp32"
+# Stage 1 gate passed 2026-11-20 (k=3 fp16): tune F1 0.9877 / exact 0.9586 / within1 0.9989,
+# holdout F1 0.9901 / exact 0.9683 / within1 0.9990 (accept bar 0.985 / 0.93 / 0.985).
+DEFAULT_SAMPLE = 3  # frames per second sent to the model; 0 = every frame (brute force)
+DEFAULT_PRECISION = "fp16"
 
 
 class Record(NamedTuple):
@@ -354,6 +356,11 @@ def _main(args, stats):
     timers = Timers()
     stats["timers"] = timers
     try:
+        from vidx.output import check_config
+
+        # legacy (no config file) = the old defaults; with a checkpoint the fingerprint already checked it
+        check_config(args.output, args.resume, {"sample": args.sample, "precision": args.precision},
+                     legacy_config=None if ckpt else {"sample": 0, "precision": "fp32"})
         writer = OutputWriter(args.output, resume=args.resume)
     except ResumeError as e:
         print(str(e), file=sys.stderr)

@@ -306,7 +306,7 @@ class CheckpointMainTest(unittest.TestCase):
         with FakeRun() as fr:
             self.assertEqual(fr.main("r.jsonl"), 0)
             self.assertNotIn("vidx.checkpoint", sys.modules)
-            self.assertEqual(sorted(p.name for p in fr.root.iterdir()), ["in", "r.jsonl", "r.jsonl.done"])
+            self.assertEqual(sorted(p.name for p in fr.root.iterdir()), ["in", "r.jsonl", "r.jsonl.config.json", "r.jsonl.done"])
 
     def test_fresh_run_against_existing_checkpoint_exits_2(self):
         with FakeRun() as fr:
@@ -456,7 +456,7 @@ class StatsJsonTest(unittest.TestCase):
     def test_off_by_default(self):
         with FakeRun() as fr:
             self.assertEqual(fr.main("r.jsonl"), 0)
-            self.assertEqual(sorted(p.name for p in fr.root.iterdir()), ["in", "r.jsonl", "r.jsonl.done"])
+            self.assertEqual(sorted(p.name for p in fr.root.iterdir()), ["in", "r.jsonl", "r.jsonl.config.json", "r.jsonl.done"])
 
 
 class SummarizeTest(unittest.TestCase):
@@ -464,6 +464,23 @@ class SummarizeTest(unittest.TestCase):
         counts, best = summarize([0, 0, 2, 67, 5], [0.5, 0.9, 0.6, 0.41, 0.99])
         self.assertEqual(counts, [2, 1, 0, 0, 1])  # class 5 (bus) ignored
         self.assertEqual(best, [0.9, 0.6, 0.0, 0.0, 0.41])
+
+
+class RunConfigResumeTest(unittest.TestCase):
+    """<output>.config.json: --resume never mixes sampling / precision settings in one output."""
+
+    def test_resume_with_other_settings_refused(self):
+        with FakeRun(n_videos=4) as fr:
+            self.assertEqual(fr.main("r.jsonl", "--limit-videos", "2", "--sample", "3"), 0)
+            self.assertEqual(fr.main("r.jsonl", "--resume", "--sample", "5"), 2)
+            self.assertEqual(fr.main("r.jsonl", "--resume", "--sample", "3"), 0)
+
+    def test_legacy_output_counts_as_brute_force(self):
+        with FakeRun(n_videos=4) as fr:
+            self.assertEqual(fr.main("r.jsonl", "--limit-videos", "2", "--sample", "0", "--precision", "fp32"), 0)
+            (fr.root / "r.jsonl.config.json").unlink()  # as written before the config file existed
+            self.assertEqual(fr.main("r.jsonl", "--resume"), 2)  # new defaults (k=3 fp16) differ
+            self.assertEqual(fr.main("r.jsonl", "--resume", "--sample", "0", "--precision", "fp32"), 0)
 
 
 if __name__ == "__main__":

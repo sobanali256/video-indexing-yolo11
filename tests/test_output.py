@@ -132,5 +132,26 @@ class OutputTest(unittest.TestCase):
         w.close()
 
 
+class CheckConfigTest(unittest.TestCase):
+    def test_fresh_resume_mismatch_and_legacy(self):
+        import tempfile
+        from vidx.output import ResumeError, check_config, config_path
+
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "r.jsonl")
+            a, b = {"sample": 3, "precision": "fp16"}, {"sample": 5, "precision": "fp16"}
+            check_config(out, False, a)
+            self.assertTrue(config_path(out).exists())
+            check_config(out, True, a)  # same settings: fine
+            with self.assertRaises(ResumeError):
+                check_config(out, True, b)
+            config_path(out).unlink()
+            open(out, "w").write('{"video": "x:0", "second": 0}\n')
+            with self.assertRaises(ResumeError):  # legacy output = the given legacy settings
+                check_config(out, True, a, legacy_config={"sample": 0, "precision": "fp32"})
+            check_config(out, True, a, legacy_config=None)  # checkpoint path: accepted, file written
+            self.assertTrue(config_path(out).exists())
+
+
 if __name__ == "__main__":
     unittest.main()

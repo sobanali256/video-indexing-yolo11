@@ -43,6 +43,12 @@ Deadline: **Sun 22 Nov 2026, 23:55 PKT**
 - [ ] Final secret scan + push before deadline
 
 ## Completed
+- 2026-11-20: **Stage 1 gate PASSED (k=3 + FP16)**. Colab gave a **Tesla T4** after the reset (not the L4), so these speeds are not comparable with the L4 baseline.
+  - k=3 FP32 tune (pipeline vs simulator check): F1 0.9879 / exact 0.9586 / within1 0.9989 vs simulator 0.9880 / 0.9584 / 0.9988. Off by about 1–2 seconds out of 9,144, not bit-identical. Consistent with batch composition / GPU (T4 vs the L4 reference) flipping conf ~0.4 detections (batch_agreement already showed < 0.1% such frames). Not a sampling bug: the inferred frames (27,431 = 0.108) match the simulator's fraction exactly. clean=no (download running).
+  - **k=3 FP16 tune: F1 0.9877, exact 0.9586, within1 0.9989** → accepted (bar 0.985 / 0.93 / 0.985). T4: 544.9 decoded fps; decode 201 s, infer 261 s of 466 s; per image inf 7.04 ms, pre 1.52, post 0.80.
+  - **k=3 FP16 holdout: F1 0.9901, exact 0.9683, within1 0.9990** → accepted. T4: 564.5 fps (486,831 frames, 862 s).
+  - Speed on T4: brute force on the T4 is ~20 ms/frame FP32 (from the k3 fp32 row: inf 17.2 + pre 1.8 + post 1.1) ≈ 48 fps, so k=3 FP16 ≈ **11x on the same GPU**. Decode is now ~43% of the loop on the T4 runtime (few CPU cores), so Stage 2a overlap matters.
+  - **Defaults set:** `DEFAULT_SAMPLE = 3`, `DEFAULT_PRECISION = "fp16"` (README updated). Brute-force reference runs in baseline.ipynb / SETUP.md now pass `--sample 0 --precision fp32` explicitly.
 - 2026-11-20: **Code review #4 (Stage 0/1, commit 4626e7b)**, 6 findings, all fixed (164 tests pass):
   - (important) Unbounded per-second buffer on broken timestamps → `MAX_GROUP = 240` frames per group in `vidx.sampling` (shared by simulator and pipeline; no effect on normal videos up to 240 fps).
   - (important) The fingerprint config broke resume of older checkpoints → config is left out for the baseline (sample 0, fp32); the error message names --sample / --precision.

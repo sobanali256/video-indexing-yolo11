@@ -12,6 +12,41 @@ def sidecar_path(output):
     return Path(str(output) + ".done")
 
 
+def config_path(output):
+    return Path(str(output) + ".config.json")
+
+
+def check_config(output, resume, config, legacy_config=None):
+    """Settings that change the results (e.g. sampling, precision) are stored in <output>.config.json.
+
+    Fresh run: (re)write it. --resume: refuse if the stored settings differ, so one output never mixes two
+    configurations. A previous run without the file (made before it existed) counts as legacy_config;
+    legacy_config=None accepts it (used when a checkpoint fingerprint already checked the settings).
+    """
+    if config is None:
+        return
+    path = config_path(output)
+    if resume:
+        previous = None
+        if path.exists():
+            try:
+                previous = json.loads(path.read_text(encoding="utf-8"))
+            except ValueError:
+                raise ResumeError(f"cannot resume: {path} is unreadable; delete it only if you know the settings match")
+        elif sidecar_path(output).exists() or (Path(output).exists() and Path(output).stat().st_size > 0):
+            previous = legacy_config
+        if previous is not None and previous != config:
+            raise ResumeError(
+                f"cannot resume: {output} was made with {previous}, this run uses {config}. "
+                "Pass the same --sample / --precision, or write to a new output."
+            )
+    if Path(output).parent != Path(""):
+        Path(output).parent.mkdir(parents=True, exist_ok=True)
+    tmp = Path(str(path) + ".tmp")
+    tmp.write_text(json.dumps(config, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
 class OutputWriter:
     """One write + flush per video, then the video id is appended to the sidecar.
 
