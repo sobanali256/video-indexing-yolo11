@@ -91,7 +91,7 @@ The plain grader command (no dumps, no checkpoints) wrapped by `bench.py`; its o
 cd /content/video-indexing-yolo11
 DRIVE=/content/drive/MyDrive/vidx
 mkdir -p $DRIVE/reference
-/content/venv/bin/python bench.py run --label "brute force baseline" --input /content/subset/tune --out /content/ref/ref_tune.jsonl --log $DRIVE/bench_log.csv -- --sample 0 --precision fp32
+/content/venv/bin/python bench.py run --label "brute force baseline" --input /content/subset/tune --out /content/ref/ref_tune.jsonl --log $DRIVE/bench_log.csv -- --sample 0 --precision fp32 --decode-threads 0
 cp /content/ref/ref_tune.jsonl $DRIVE/reference/
 ```
 The timing must come from **one uninterrupted run**: after a runtime reset just run it again from scratch. The
@@ -108,7 +108,7 @@ Into the **same** `--local-dir`, so the 3 existing files are skipped (check the 
 ## 9. Tune dump run (may overlap the download; not timed)
 Dumps and checkpoints go to Drive, the output stays local. Gives per-frame data for offline tuning and a determinism check:
 ```
-!cd /content/video-indexing-yolo11 && nohup /content/venv/bin/python run.py --input /content/subset/tune --output /content/ref/ref_tune_dump.jsonl --dump-frames /content/drive/MyDrive/vidx/frames --checkpoint-dir /content/drive/MyDrive/vidx/ckpt --run-name ref_tune_dump --sample 0 --precision fp32 > /content/tune_dump.log 2>&1 &
+!cd /content/video-indexing-yolo11 && nohup /content/venv/bin/python run.py --input /content/subset/tune --output /content/ref/ref_tune_dump.jsonl --dump-frames /content/drive/MyDrive/vidx/frames --checkpoint-dir /content/drive/MyDrive/vidx/ckpt --run-name ref_tune_dump --sample 0 --precision fp32 --decode-threads 0 > /content/tune_dump.log 2>&1 &
 ```
 After a reset: redo steps 1-4, re-download the 3 reference files (the step 6 download command), recreate the symlinks and, if the 50-file download (step 8) had not finished, start it again, then the same command **with `--resume`**. A fresh run without
 `--resume` refuses to start when a checkpoint with that run name exists. Elapsed time across sessions: `progress.json`
@@ -116,7 +116,7 @@ in the newest checkpoint generation (`compute_s`, `wall_first_start`, `wall_last
 
 ## 10. Holdout reference (no dumps: holdout is never tuned on)
 ```
-!cd /content/video-indexing-yolo11 && nohup /content/venv/bin/python run.py --input /content/subset/holdout --output /content/ref/ref_holdout.jsonl --checkpoint-dir /content/drive/MyDrive/vidx/ckpt --run-name ref_holdout --sample 0 --precision fp32 > /content/holdout.log 2>&1 &
+!cd /content/video-indexing-yolo11 && nohup /content/venv/bin/python run.py --input /content/subset/holdout --output /content/ref/ref_holdout.jsonl --checkpoint-dir /content/drive/MyDrive/vidx/ckpt --run-name ref_holdout --sample 0 --precision fp32 --decode-threads 0 > /content/holdout.log 2>&1 &
 ```
 After a reset: redo steps 1-4, re-download the 3 reference files (the step 6 download command), recreate the symlinks and, if the 50-file download (step 8) had not finished, start it again, then use `--resume`.
 

@@ -458,6 +458,8 @@ def _main(args, stats):
             from vidx.model import prepare_direct
 
             log.info("direct path: conf, iou, classes, agnostic, max_det, fp16, imgsz = %s", prepare_direct(model))
+            for key in model.speed:  # drop the warm-up call from the run's stats (infer_tensor fills them)
+                model.speed[key] = 0
         except Exception as e:  # the faster path may cost speed, never the run: fall back to predict() per video
             log.warning("direct path unavailable (%s: %s): falling back to --decode-threads 0", type(e).__name__, e)
             threads = 0

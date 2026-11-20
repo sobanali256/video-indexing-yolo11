@@ -44,6 +44,11 @@ Deadline: **Sun 22 Nov 2026, 23:55 PKT**
 - [ ] Final secret scan + push before deadline
 
 ## Completed
+- 2026-11-20: **Code review #6 (commit cfd9662)**, 4 findings fixed. None changes results; results-v1 stays the full-run configuration.
+  - (important) `--dump-frames` commands in baseline.ipynb / SETUP.md failed with exit 2 under the new default of 2 threads → reference and dump commands pass `--sample 0 --precision fp32 --decode-threads 0`. The README says dumps need `--decode-threads 0`.
+  - (nit) Brute-force references now stay on plain `predict()` (`--decode-threads 0`), also in the speedup.ipynb profile cell, so the reference never shares code with the direct path it checks.
+  - (nit) 5.4 resume checks out the commit recorded in `full50.commit.txt` before resuming; 5.2 checks out `results-v1` (never a newer main).
+  - (pre-existing) Stats: model.speed is reset after the prepare_direct warm-up.
 - 2026-11-20: **Stage 2a gate PASSED (L4)**, defaults now k=3 + FP16 + **2 decode threads**:
   - 4.1 direct path vs predict(): identical counts **1.0000, max conf gap 0.00000** in FP32 and FP16 (1,000 frames, 32 batches); predictor args conf 0.4, iou 0.7, classes [0,2,16,63,67], agnostic False, max_det 300, imgsz (640, 640).
   - 4.2 tune (all F1 0.9878, exact 0.9588, within1 0.9989):
