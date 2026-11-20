@@ -39,3 +39,8 @@ Thumbs.db
 
 # Ultralytics settings dir created by prepare.py
 .yolo_config/
+
+# run side files (only results.jsonl.gz is committed)
+*.jsonl.done
+*.jsonl.config.json
+*.stats.json

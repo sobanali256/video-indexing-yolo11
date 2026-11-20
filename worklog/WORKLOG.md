@@ -3,7 +3,7 @@
 Deadline: **Sun 22 Nov 2026, 23:55 PKT**
 
 ## Next up
-- **(2026-11-20 evening) Stages 1 + 2a validated; defaults k=3 + FP16 + 2 decode threads (tag `results-v1`).** Next: full 50-file run on the L4 (speedup.ipynb section 5), then results.jsonl.gz into the repo, HARDWARE.md, README performance. Stage 3 (TensorRT) only after the deliverables are safe; any new default needs a re-run.
+- **(2026-11-20 evening) Stages 1 + 2a validated; defaults k=3 + FP16 + 2 decode threads (tag `results-v1`).** Full run DONE 2026-11-20 (1 h 52 min, 1,650 videos, 0 errors). Next: results.jsonl.gz into the repo, HARDWARE.md, README performance, ai_chats. Stage 3 (TensorRT) only after the deliverables are safe; any new default needs a re-run.
 - **(2026-11-20) Speed-up plan APPROVED:** `worklog/plans/2026-11-20-speedup-plan.md`. Margin: F1 >= 0.98, exact >= 0.92, within1 >= 0.98 on tune AND holdout. Stages: 0 profile -> 1 sampling (offline simulator on tune dumps) + FP16 -> 2a decode workers + mp queue + cross-video batching + direct-tensor infer (2b shared memory only if profiling says so) -> 3 TensorRT if time. Schedule: Sat morning re-download 50 files + offline-run test; **Sat night launch full 50-file run** with best validated stage, tag that commit (defaults = results config); Sun deliverables + user writes WRITEUP.md (2-3 h). Independent review done (2 blockers, 9 important; all folded into the plan's 'Amendments' section). User decisions: FP16 allowed if it passes the margin (note in write-up); Stage 2a threads-first in one process; start the 50-file download tonight. Next action: check `$DRIVE/frames` has 33 npz, start the download, then Stage 0 + 1a executed with Sonnet.
 0. **Where we stopped (2026-11-20):** Colab (website, not the VS Code extension — it was buggy) session reached step 11 "Checks"; the cell had been running > 30 min. Collect from the user: the `bench_log.csv` "brute force baseline" row, machine check output, and whatever the checks cell printed. Then investigate the slow checks (open issue #8).
 1. (done) code review of 2026-11-20 changes; commits 4009eeb, 17a55b9 (MPLBACKEND fix, Colab website), f3e3b60 (single `--include` for the 3 reference files).
@@ -44,6 +44,15 @@ Deadline: **Sun 22 Nov 2026, 23:55 PKT**
 - [ ] Final secret scan + push before deadline
 
 ## Completed
+- 2026-11-20: **FULL 50-FILE RUN DONE (results-v1 = cfd9662, NVIDIA L4, Colab):**
+  - 1,650 videos, 0 errors, 12,981,615 frames (matches count_frames exactly), 1,385,035 inferred (10.7%).
+  - Wall 15:15:36 → 17:07:37 UTC (one session, no resets): compute 6,721.4 s = **1 h 52 min**; loop 6,718.2 s; startup 3.3 s; **1,932 fps**.
+  - Thread-summed decode 5,876 s, infer 6,694 s (GPU-bound).
+  - vs brute force projection 124,936 s (34.7 h): **18.6x**.
+  - check_schema OK. Sanity scores on the reference files: tune 0.9878 / 0.9588 / 0.9989, holdout 0.9902 / 0.9680 / 0.9990 (identical to the Stage 2a gate).
+  - `results.jsonl.gz` (1,386,916 bytes) on Drive at `vidx/results.jsonl.gz`; stats in `vidx/full50.stats.json`, commit/GPU in `vidx/full50.commit.txt`.
+  - Stats `model_speed` includes the warm-up predict (fixed later in c6b4f13; cosmetic).
+  - Next: copy results.jsonl.gz into the repo, HARDWARE.md, README performance section, ai_chats, final secret scan + push. Then optional Stage 3 (TensorRT, needs a re-run).
 - 2026-11-20: **Code review #6 (commit cfd9662)**, 4 findings fixed. None changes results; results-v1 stays the full-run configuration.
   - (important) `--dump-frames` commands in baseline.ipynb / SETUP.md failed with exit 2 under the new default of 2 threads → reference and dump commands pass `--sample 0 --precision fp32 --decode-threads 0`. The README says dumps need `--decode-threads 0`.
   - (nit) Brute-force references now stay on plain `predict()` (`--decode-threads 0`), also in the speedup.ipynb profile cell, so the reference never shares code with the direct path it checks.

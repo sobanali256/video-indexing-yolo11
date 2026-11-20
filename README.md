@@ -2,7 +2,17 @@
 
 Per-second object indexing of FineVideo with Ultralytics YOLO11l (person, car, dog, laptop, cell phone + people count), optimised for speed.
 
-> Work in progress: the performance section will be filled in after the full run. Validated so far (L4): 3 sampled frames per second + FP16 + 2 decode threads, ~18x faster than every-frame brute force at F1 0.99 / people exact 0.96-0.97 / within +-1 0.999 on the tune and holdout references.
+## Performance (NVIDIA L4, details in `HARDWARE.md`)
+| | Brute force (every frame, FP32) | This pipeline (defaults) |
+|---|---|---|
+| All 50 files (12.98 M frames) | ~34.7 h (projected from a timed file) | **1 h 52 min** (measured) |
+| Throughput | 104 frames/s | 1,932 frames/s (**18.6x**) |
+| Tune reference (train-00000): F1 / people exact / within ±1 | 1 / 1 / 1 | 0.988 / 0.959 / 0.999 |
+| Holdout reference (train-00024, -00049) | 1 / 1 / 1 | 0.990 / 0.968 / 0.999 |
+
+Pass thresholds: F1 >= 0.95, exact >= 0.85, within ±1 >= 0.95. Parameters were chosen on the tune file only; the holdout files were only scored.
+How: every frame is decoded and timestamped, but only 3 evenly spaced frames per second go to the model (FP16); decode,
+sampling and letterboxing run in 2 threads while the GPU infers batches built across videos.
 
 ## Install (Ubuntu 22.04, Python 3.11, CUDA 12)
 ```
