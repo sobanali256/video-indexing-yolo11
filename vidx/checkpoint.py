@@ -24,7 +24,7 @@ log = logging.getLogger("vidx.checkpoint")
 KEEP = 2  # generations kept per store
 PAYLOAD = ("results.jsonl.gz", "done.txt", "progress.json")
 FILES = PAYLOAD + ("manifest.json",)  # manifest last
-TIMER_KEYS = ("decode", "infer", "aggregate", "frames", "videos", "errors")
+TIMER_KEYS = ("decode", "infer", "aggregate", "frames", "inferred_frames", "videos", "errors")
 
 
 class CheckpointError(RuntimeError):
@@ -35,10 +35,13 @@ def gen_name(n):
     return f"gen-{n:04d}"
 
 
-def make_fingerprint(input_path, limit_videos, output, run_name):
+def make_fingerprint(input_path, limit_videos, output, run_name, config=None):
     """What must be identical for a resume. The parquet files themselves are checked separately
-    (Checkpointer.inputs_used), so files added to the input folder later do not matter."""
+    (Checkpointer.inputs_used), so files added to the input folder later do not matter.
+    config: settings that change the results (sampling, precision), so a resume never mixes them."""
     fp = {"input": str(input_path), "limit_videos": limit_videos, "output": Path(output).name, "run_name": run_name}
+    if config:
+        fp["config"] = config
     return json.loads(json.dumps(fp))
 
 

@@ -149,11 +149,17 @@ def _open(data):
     return av.open(io.BytesIO(memoryview(data)))
 
 
-def decode_video(data):
+def decode_video(data, sample=0, counter=None):
     """Generator of Frame for the first real video stream. Raises on open/decode errors.
 
-    Frames yielded before an error are valid; the caller decides what to do with them.
+    sample=K > 0: every frame is still decoded and timestamped, but only K evenly spaced frames
+    per second (vidx.sampling) are converted to BGR, rotated and yielded. sample=0: every frame.
+    counter: optional object whose `decoded_frames` attribute is incremented per decoded frame.
+    Frames yielded before an error are valid (with sampling, the second in progress is sampled
+    and yielded before the error is re-raised); the caller decides what to do with them.
     """
+    from .sampling import sample_groups
+
     container = _open(data)
     try:
         stream = pick_video_stream(container)
@@ -163,8 +169,17 @@ def decode_video(data):
         rate = stream.guessed_rate or stream.average_rate
         stamper = Timestamper(stream.time_base, rate)
         base_rotation = stream_rotation(stream)
-        for frame in container.decode(stream):
-            t = stamper.stamp(frame.pts)
+
+        def stamped():
+            for frame in container.decode(stream):
+                if counter is not None:
+                    counter.decoded_frames += 1
+                yield frame, stamper.stamp(frame.pts)
+
+        raw = stamped()
+        if sample > 0:
+            raw = sample_groups(raw, lambda item: item[1], sample)
+        for frame, t in raw:
             rot = frame_rotation(frame, base_rotation)
             image = frame.to_ndarray(format="bgr24")
             if rot:

@@ -1,6 +1,7 @@
 """YOLO11l behind load_model() / infer(); swap this module for another backend later."""
 import os
 import tempfile
+import time
 from pathlib import Path
 
 from .aggregate import COCO_IDS
@@ -30,12 +31,16 @@ def summarize(cls_ids, confs):
 
 
 class Model:
-    def __init__(self, yolo, device):
+    def __init__(self, yolo, device, half=False):
         self.yolo = yolo
         self.device = device
+        self.half = half
+        # Stage-0 profile: Ultralytics' per-image ms summed over all images, plus predict() wall time
+        self.speed = {"preprocess_ms": 0.0, "inference_ms": 0.0, "postprocess_ms": 0.0,
+                      "predict_wall_s": 0.0, "predict_calls": 0, "images": 0}
 
 
-def load_model(weights=None, device=None, offline=True):
+def load_model(weights=None, device=None, offline=True, half=False):
     weights = Path(weights) if weights else default_weights()
     weights = weights.resolve()
     if not weights.is_file():
@@ -54,7 +59,8 @@ def load_model(weights=None, device=None, offline=True):
         pass
     if device is None:
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    return Model(YOLO(str(weights), task="detect"), device)
+    half = bool(half) and str(device).startswith("cuda")  # FP16 only on the GPU
+    return Model(YOLO(str(weights), task="detect"), device, half)
 
 
 def infer(model, frames, classes=COCO_IDS):
@@ -62,12 +68,21 @@ def infer(model, frames, classes=COCO_IDS):
 
     classes=None disables the class filter (counts are still reported for the 5 classes).
     """
+    t0 = time.perf_counter()
     results = model.yolo.predict(
-        frames, imgsz=IMGSZ, conf=CONF, iou=IOU, half=False, verbose=False,
+        frames, imgsz=IMGSZ, conf=CONF, iou=IOU, half=model.half, verbose=False,
         device=model.device, classes=classes, save=False,
     )
+    sp = model.speed
+    sp["predict_wall_s"] += time.perf_counter() - t0
+    sp["predict_calls"] += 1
     out = []
     for r in results:
+        speed = getattr(r, "speed", None) or {}
+        sp["preprocess_ms"] += speed.get("preprocess") or 0.0
+        sp["inference_ms"] += speed.get("inference") or 0.0
+        sp["postprocess_ms"] += speed.get("postprocess") or 0.0
+        sp["images"] += 1
         if r.boxes is None or len(r.boxes) == 0:
             out.append(summarize([], []))
         else:

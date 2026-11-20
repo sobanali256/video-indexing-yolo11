@@ -3,7 +3,7 @@
 Deadline: **Sun 22 Nov 2026, 23:55 PKT**
 
 ## Next up
-- **(2026-11-20) Baseline complete.** Next: plan-mode (Opus) speed-up plan. Order: frame sampling first (inference is ~98% of time), then FP16 / batch size / decode-infer overlap, TensorRT only if still GPU-bound. Also fix the notebook gaps: copy logs + stats.json to Drive; wait for the holdout run to finish before the checks / copy step. Rotation check still to confirm.
+- **(2026-11-20) Speed-up plan APPROVED:** `worklog/plans/2026-11-20-speedup-plan.md`. Margin: F1 >= 0.98, exact >= 0.92, within1 >= 0.98 on tune AND holdout. Stages: 0 profile -> 1 sampling (offline simulator on tune dumps) + FP16 -> 2a decode workers + mp queue + cross-video batching + direct-tensor infer (2b shared memory only if profiling says so) -> 3 TensorRT if time. Schedule: Sat morning re-download 50 files + offline-run test; **Sat night launch full 50-file run** with best validated stage, tag that commit (defaults = results config); Sun deliverables + user writes WRITEUP.md (2-3 h). Independent review done (2 blockers, 9 important; all folded into the plan's 'Amendments' section). User decisions: FP16 allowed if it passes the margin (note in write-up); Stage 2a threads-first in one process; start the 50-file download tonight. Next action: check `$DRIVE/frames` has 33 npz, start the download, then Stage 0 + 1a executed with Sonnet.
 0. **Where we stopped (2026-11-20):** Colab (website, not the VS Code extension — it was buggy) session reached step 11 "Checks"; the cell had been running > 30 min. Collect from the user: the `bench_log.csv` "brute force baseline" row, machine check output, and whatever the checks cell printed. Then investigate the slow checks (open issue #8).
 1. (done) code review of 2026-11-20 changes; commits 4009eeb, 17a55b9 (MPLBACKEND fix, Colab website), f3e3b60 (single `--include` for the 3 reference files).
 2. Colab L4, run order in `colab/baseline.ipynb` / `colab/SETUP.md` (Drive = `/content/drive/MyDrive/vidx`):
@@ -43,6 +43,14 @@ Deadline: **Sun 22 Nov 2026, 23:55 PKT**
 - [ ] Final secret scan + push before deadline
 
 ## Completed
+- 2026-11-20: **Stage 0 + Stage 1 code (not yet run on Colab):**
+  - `vidx/sampling.py`: `pick(n, k)` (evenly spaced centres; all frames if n <= k or k <= 0), `iter_groups` (a group closes when int(t) changes; on a decode error the buffered group is yielded, then the error re-raised = blocker B1), `sample_groups`.
+  - `vidx/decode.py`: `decode_video(data, sample=0, counter=None)` decodes and stamps every frame, converts only the sampled ones, counts decoded frames.
+  - `vidx/model.py`: `load_model(half=)` (FP16 only on CUDA); `infer` sums Ultralytics `r.speed` and predict() wall time into `model.speed`.
+  - `run.py`: `--sample K` (default `DEFAULT_SAMPLE=0`) and `--precision fp16|fp32` (default `DEFAULT_PRECISION="fp32"`); defaults change only after the tune+holdout gate. `Timers.frames` = decoded frames, plus `inferred_frames` (blocker B2). Stats JSON adds inferred_frames, sample, precision, model_speed. The checkpoint fingerprint includes sample + precision.
+  - `bench.py`: these go into the notes column (no new CSV columns).
+  - New tools: `tools/simulate_sampling.py` (offline, tune dumps + score.py, accept 0.985/0.93/0.985, k=0 sanity check must be 1.0), `tools/profile_decode.py`.
+  - Tests: 160 pass (new test_sampling, test_simulate_sampling, ProfileNoteTest).
 - 2026-11-20: **Brute-force baseline projection (Colab L4):** `bench.py extrapolate` -> projected **124,936 s (34.70 h)** for **12,981,615 frames** (all 50 files). Derived: ~9.6 ms/frame (~104 fps end-to-end); dataset averages ~28.8 fps of video (12.98 M frames / ~125 h). Unseen ~13 h test set ≈ 1.35 M frames ≈ ~3.6 h brute force on L4 (under the 6 h cap, but this is the number to beat). Still to collect: the tune row's decode_s / infer_s / aggregate_s split (decides whether decode or GPU is the bottleneck) and the checks output.
 - 2026-11-20: **Tune measured row** (bench_log.csv, clean=yes, L4): 33 videos, 253,918 frames, wall 2447.3 s, startup 2.7 s, loop 2443.7 s, 103.9 fps. CSV has no decode/infer split: it is in `/content/ref/ref_tune.jsonl.stats.json` (not collected yet).
 - 2026-11-20: **Step 11 checks:** tune schema OK (33 videos, 9,144 seconds, 0 errors); tune self-score 1.0/1.0/1.0; decoder agreement (PyAV vs cv2, 20 videos) micro F1 1.0000; batch vs single identical counts 1.0000 (max conf gap 0.00173); classes filter vs none identical. **Holdout reference is EMPTY** (check_schema: 0 videos), see issue #10. Rotation (`find_rotated`) and determinism (tune vs tune_dump) outputs were not in the paste.

@@ -298,3 +298,17 @@ class ExtrapolateTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProfileNoteTest(unittest.TestCase):
+    def test_empty_and_full(self):
+        self.assertEqual(bench.profile_note({}), "")
+        note = bench.profile_note({
+            "inferred_frames": 50, "sample": 5, "precision": "fp16", "decode_s": 2.0, "infer_s": 10.0,
+            "model_speed": {"preprocess_ms": 100.0, "inference_ms": 300.0, "postprocess_ms": 50.0,
+                            "predict_wall_s": 0.5, "predict_calls": 2, "images": 50},
+        })
+        self.assertIn("inferred=50", note)
+        self.assertIn("sample=5", note)
+        self.assertIn("precision=fp16", note)
+        self.assertIn("pre=2.00 inf=6.00 post=1.00 other=1.00", note)  # (500 - 450) ms / 50 images

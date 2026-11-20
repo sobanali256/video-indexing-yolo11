@@ -117,14 +117,16 @@ class ProcessFramesTest(unittest.TestCase):
 
 
 def make_args(**kw):
-    return SimpleNamespace(**{"batch": 4, "dump_frames": None, **kw})
+    return SimpleNamespace(**{"batch": 4, "dump_frames": None, "sample": 0, **kw})
 
 
 def fake_decode(n=3, fail_after=None):
-    def decode(data):
+    def decode(data, sample=0, counter=None):
         for i in range(n):
             if fail_after == i:
                 raise ValueError("corrupt packet")
+            if counter is not None:
+                counter.decoded_frames += 1
             yield frame(F(i, 2), person=1)
     return decode
 
@@ -182,7 +184,7 @@ class MainAbortTest(unittest.TestCase):
             raise RuntimeError("driver broke")
 
         vidx.decode.decode_video = fake_decode()
-        vidx.model.load_model = lambda: SimpleNamespace(device="cpu")
+        vidx.model.load_model = lambda **kw: SimpleNamespace(device="cpu", half=False, speed={})
         vidx.model.infer = bad_infer
         vidx.source.iter_rows = lambda path: ((f"p:{i}", b"", None) for i in range(10))
         try:
@@ -197,10 +199,12 @@ class MainAbortTest(unittest.TestCase):
             (vidx.decode.decode_video, vidx.model.load_model, vidx.model.infer, vidx.source.iter_rows) = saved
 
 
-def fake_decode_by_data(data):
+def fake_decode_by_data(data, sample=0, counter=None):
     """Deterministic fake video: data is the video id as bytes; person count depends on it."""
     n = 2 + len(data) % 3
     for i in range(n):
+        if counter is not None:
+            counter.decoded_frames += 1
         yield frame(F(i, 2), person=(len(data) + i) % 4)
 
 
@@ -231,7 +235,7 @@ class FakeRun:
         self.mods = (vidx.decode, vidx.model, vidx.source)
         self.saved = (vidx.decode.decode_video, vidx.model.load_model, vidx.model.infer, vidx.source.iter_rows)
         vidx.decode.decode_video = fake_decode_by_data
-        vidx.model.load_model = lambda: SimpleNamespace(device="cpu")
+        vidx.model.load_model = lambda **kw: SimpleNamespace(device="cpu", half=False, speed={})
         vidx.model.infer = self.infer
         vidx.source.iter_rows = self.rows
         return self
@@ -380,7 +384,8 @@ class CheckpointMainTest(unittest.TestCase):
 
 
 class StatsJsonTest(unittest.TestCase):
-    KEYS = {"videos", "errors", "frames", "decode_s", "infer_s", "aggregate_s", "loop_s", "startup_s",
+    KEYS = {"videos", "errors", "frames", "inferred_frames", "decode_s", "infer_s", "aggregate_s", "loop_s", "startup_s",
+            "sample", "precision", "model_speed",
             "exit_code", "argv"}
 
     def stats(self, fr, name="s.json"):

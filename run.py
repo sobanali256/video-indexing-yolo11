@@ -20,6 +20,10 @@ from vidx.aggregate import aggregate, error_line, make_lines
 _PROCESS_START = time.perf_counter()  # approximates process start: startup_s = imports + CUDA init + model load
 log = logging.getLogger("run")
 MAX_INFERENCE_FAILURES = 3
+# Defaults of the grader command (`run.py --input --output`). They change only after a setting passed the
+# accuracy margin on tune AND holdout; the commit that produced results.jsonl.gz is tagged with them.
+DEFAULT_SAMPLE = 0  # frames per second sent to the model; 0 = every frame (brute force)
+DEFAULT_PRECISION = "fp32"
 
 
 class Record(NamedTuple):
@@ -36,14 +40,24 @@ class InferenceError(Exception):
 
 
 class Timers:
+    """frames = frames decoded (the unit of speed and extrapolation); inferred_frames = frames sent to
+    the model. Without sampling both are equal. Fakes that bypass the decoder count inferred frames as
+    decoded (see process_frames)."""
+
     def __init__(self):
         self.decode = self.infer = self.aggregate = 0.0
-        self.frames = self.videos = self.errors = 0
+        self.videos = self.errors = 0
+        self.decoded_frames = self.inferred_frames = 0
+
+    @property
+    def frames(self):
+        return self.decoded_frames
 
     def summary(self, total):
         fps = self.frames / total if total > 0 else 0.0
         return (
-            f"videos {self.videos} (errors {self.errors}), frames {self.frames} | "
+            f"videos {self.videos} (errors {self.errors}), frames {self.frames} "
+            f"(inferred {self.inferred_frames}) | "
             f"decode {self.decode:.1f}s, infer {self.infer:.1f}s, aggregate {self.aggregate:.1f}s, "
             f"total {total:.1f}s | {fps:.1f} frames/s overall"
         )
@@ -123,8 +137,22 @@ def process_frames(frames, infer_fn, batch_size, timers, keep_details=False):
         if len(pending) >= batch_size:
             flush()
     flush()  # frames decoded before a decode error are still valid
-    timers.frames += len(records)
+    timers.inferred_frames += len(records)
+    if not getattr(frames, "counts_decoded", False):  # plain iterators (tests, tools): decoded == inferred
+        timers.decoded_frames += len(records)
     return records, error
+
+
+class CountedFrames:
+    """Wraps a decode generator that increments timers.decoded_frames itself (see process_frames)."""
+
+    counts_decoded = True
+
+    def __init__(self, gen):
+        self.gen = gen
+
+    def __iter__(self):
+        return self.gen
 
 
 def video_lines(video_id, records, error):
@@ -174,7 +202,8 @@ def process_video(video_id, data, infer_fn, args, timers):
 
     try:
         records, error = process_frames(
-            decode_video(data), infer_fn, args.batch, timers, keep_details=bool(args.dump_frames)
+            CountedFrames(decode_video(data, sample=args.sample, counter=timers)),
+            infer_fn, args.batch, timers, keep_details=bool(args.dump_frames),
         )
         t0 = time.perf_counter()
         lines = video_lines(video_id, records, error)
@@ -196,6 +225,10 @@ def parse_args(argv=None):
     ap.add_argument("--input", required=True, help="folder of .parquet files (or one file)")
     ap.add_argument("--output", required=True, help="results.jsonl")
     ap.add_argument("--batch", type=int, default=32, help="inference batch size (default 32)")
+    ap.add_argument("--sample", type=int, default=DEFAULT_SAMPLE, metavar="K",
+                    help=f"frames per second sent to the model, evenly spaced; 0 = every frame (default {DEFAULT_SAMPLE})")
+    ap.add_argument("--precision", choices=["fp16", "fp32"], default=DEFAULT_PRECISION,
+                    help=f"model precision on the GPU (default {DEFAULT_PRECISION})")
     ap.add_argument("--resume", action="store_true", help="continue a previous run (uses <output>.done)")
     ap.add_argument("--limit-videos", type=int, default=None, help="only the first N videos")
     ap.add_argument("--dump-frames", default=None, metavar="DIR", help="save per-frame npz per video")
@@ -220,7 +253,8 @@ def setup_checkpoint(args, files):
         stores.append(checkpoint.DirStore(args.checkpoint_dir, run_name))
     if args.checkpoint_hf_repo:
         stores.append(checkpoint.HFStore(args.checkpoint_hf_repo, run_name))
-    fp = checkpoint.make_fingerprint(Path(args.input).resolve(), args.limit_videos, args.output, run_name)
+    fp = checkpoint.make_fingerprint(Path(args.input).resolve(), args.limit_videos, args.output, run_name,
+                                     config={"sample": args.sample, "precision": args.precision})
     ckpt = checkpoint.Checkpointer(
         stores, args.output, fp, args.checkpoint_minutes, args.dump_frames,
         inputs={f.name: f.stat().st_size for f in files},
@@ -240,12 +274,16 @@ def write_stats(path, stats, timers, exit_code, argv):
         d = {
             "videos": timers.videos if timers else 0,
             "errors": timers.errors if timers else 0,
-            "frames": timers.frames if timers else 0,
+            "frames": timers.frames if timers else 0,  # decoded frames
+            "inferred_frames": timers.inferred_frames if timers else 0,
             "decode_s": timers.decode if timers else 0.0,
             "infer_s": timers.infer if timers else 0.0,
             "aggregate_s": timers.aggregate if timers else 0.0,
             "loop_s": stats.get("loop_s"),  # loop start -> loop end; None if the loop never started
             "startup_s": stats.get("startup_s"),
+            "sample": stats.get("sample"),
+            "precision": stats.get("precision"),
+            "model_speed": stats.get("model_speed"),
             "exit_code": exit_code,
             "argv": list(argv),
         }
@@ -294,11 +332,14 @@ def _main(args, stats):
         # run `finally` (stats / checkpoint) on SIGTERM; never for the plain grader command
         signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
     try:
-        model = load_model()
+        model = load_model(half=args.precision == "fp16")
     except FileNotFoundError as e:
         print(str(e), file=sys.stderr)
         return 2
-    log.info("model loaded on %s", model.device)
+    log.info("model loaded on %s (%s, sample %s)", model.device, "fp16" if model.half else "fp32", args.sample)
+    stats["sample"] = args.sample
+    stats["precision"] = "fp16" if model.half else "fp32"
+    stats["model_speed"] = model.speed  # filled in place by infer()
 
     def infer_fn(images):
         return infer(model, images)

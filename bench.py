@@ -248,6 +248,27 @@ def load_stats(path):
 
 # ---------------------------------------------------------------- run
 
+def profile_note(stats):
+    """Short summary of the run settings and the stage-0 profile for the CSV notes column (no new columns,
+    so existing bench_log.csv files stay readable). Empty if the stats file has none of it."""
+    parts = []
+    if stats.get("inferred_frames") is not None:
+        parts.append(f"inferred={stats['inferred_frames']}")
+    for key in ("sample", "precision"):
+        if stats.get(key) is not None:
+            parts.append(f"{key}={stats[key]}")
+    if stats.get("decode_s") is not None and stats.get("infer_s") is not None:
+        parts.append(f"decode_s={stats['decode_s']:.1f} infer_s={stats['infer_s']:.1f}")
+    sp = stats.get("model_speed") or {}
+    n = sp.get("images") or 0
+    if n:
+        per = {k: sp.get(k, 0.0) / n for k in ("preprocess_ms", "inference_ms", "postprocess_ms")}
+        overhead_ms = (sp.get("predict_wall_s", 0.0) * 1000 - sum(sp.get(k, 0.0) for k in per)) / n
+        parts.append("ms/img pre={:.2f} inf={:.2f} post={:.2f} other={:.2f}".format(
+            per["preprocess_ms"], per["inference_ms"], per["postprocess_ms"], overhead_ms))
+    return "; ".join(parts)
+
+
 def run_bench(args, extra, proc_scan=None, gpu_scan=None, gpu_name_fn=None, tree_fn=None):
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -280,6 +301,9 @@ def run_bench(args, extra, proc_scan=None, gpu_scan=None, gpu_name_fn=None, tree
         "wall_s": fmt(wall), "startup_s": fmt(stats.get("startup_s")), "loop_s": fmt(loop_s),
         "fps_loop": fmt(fps, 2), "notes": args.notes or "", "command": shlex.join(cmd),
     }
+    prof = profile_note(stats)
+    if prof:
+        row["notes"] = (row["notes"] + " " + prof).strip()
     exit_code = rc
     if rc != 0:
         row["notes"] = (row["notes"] + f" run.py exit code {rc}").strip()
