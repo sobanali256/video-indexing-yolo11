@@ -43,6 +43,11 @@ Deadline: **Sun 22 Nov 2026, 23:55 PKT**
 - [ ] Final secret scan + push before deadline
 
 ## Completed
+- 2026-11-20: Stage 2a GPU checks prepared:
+  - `tools/batch_agreement.py --direct --precision fp32|fp16`: predict() vs the direct path on the same frames and batches.
+  - speedup.ipynb section 4: 4.1 agreement, 4.2 tune timing with threads 0/1/2 (labels include the GPU name), 4.3 holdout.
+  - A setup guard on the Stage 1 and Stage 2a cells stops with "run section 0 first" after a reset.
+  - The T4 came from the reconnect; the L4 is still available, so timings run on the L4.
 - 2026-11-20: **Stage 2a code (off by default, `--decode-threads N`; not yet run on a GPU):**
   - `vidx/pipeline.py`: N decode threads (decode + sample + rotate + letterbox) feed a bounded queue. The main thread buckets frames by letterboxed shape across videos and runs a bucket when it is full or the queue runs dry. A video is emitted once its END has arrived and no frame of it waits in a bucket.
   - `vidx/model.py`: `prepare_direct` (one predict() call, then the predictor's own AutoBackend + args), `make_letterbox` (Ultralytics LetterBox, auto=True, the predictor's stride/imgsz), `infer_tensor` (BGR→RGB, BCHW, half/float, /255, the predictor's NMS args).
