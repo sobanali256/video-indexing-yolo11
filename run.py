@@ -113,6 +113,7 @@ def process_frames(frames, infer_fn, batch_size, timers, keep_details=False):
         t0 = time.perf_counter()
         results = run_inference(infer_fn, [f.image for f in batch])
         timers.infer += time.perf_counter() - t0
+        timers.inferred_frames += len(batch)
         for f, (counts, conf) in zip(batch, results):
             if keep_details:
                 records.append(Record(f.t, counts, conf, f.pts, f.rotation, tuple(f.image.shape)))
@@ -137,7 +138,6 @@ def process_frames(frames, infer_fn, batch_size, timers, keep_details=False):
         if len(pending) >= batch_size:
             flush()
     flush()  # frames decoded before a decode error are still valid
-    timers.inferred_frames += len(records)
     if not getattr(frames, "counts_decoded", False):  # plain iterators (tests, tools): decoded == inferred
         timers.decoded_frames += len(records)
     return records, error
@@ -312,6 +312,13 @@ def main(argv=None):
 
 
 def _main(args, stats):
+    if args.sample < 0:
+        print("--sample must be >= 0 (0 = every frame)", file=sys.stderr)
+        return 2
+    if args.dump_frames and args.sample > 0:
+        print("--dump-frames needs every frame (--sample 0): the sampling simulator treats dumps as every-frame",
+              file=sys.stderr)
+        return 2
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(asctime)s %(name)s %(message)s")
     from vidx.model import infer, load_model
     from vidx.output import OutputWriter, ResumeError

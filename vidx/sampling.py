@@ -7,7 +7,11 @@ A "group" is a run of consecutive frames whose int(t) is the same second. A grou
 as a frame of a different second arrives (also when timestamps go backwards), so a second can, in
 rare broken files, produce two groups; both the simulator and the pipeline then sample each group.
 Every group yields at least one frame, so every second that holds a frame keeps an output line.
+A group is also closed once it holds MAX_GROUP frames, so a broken file whose timestamps never
+advance (e.g. all clamped to 0) cannot buffer an unbounded number of decoded frames in memory.
 """
+
+MAX_GROUP = 240  # frames; above any real frame rate we expect, bounds memory (240 x 4K YUV ~ 3 GB)
 
 
 def pick(n, k):
@@ -27,7 +31,7 @@ def second_of(t):
 
 
 def iter_groups(items, t_of):
-    """Yield lists of consecutive items that share a second (see module docstring).
+    """Yield lists of consecutive items that share a second, at most MAX_GROUP long (see module docstring).
 
     If the iterable raises (decode failure), the group collected so far is yielded first and then
     the exception is re-raised, so frames decoded before the error are never lost.
@@ -45,7 +49,7 @@ def iter_groups(items, t_of):
                 yield group
             raise
         s = second_of(t_of(item))
-        if group and s != current:
+        if group and (s != current or len(group) >= MAX_GROUP):
             yield group
             group = []
         current = s

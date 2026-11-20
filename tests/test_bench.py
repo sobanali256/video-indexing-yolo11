@@ -295,11 +295,6 @@ class ExtrapolateTest(unittest.TestCase):
         self.assertEqual(self.extrapolate(), 2)
         self.assertEqual(len(bench.read_rows(self.log)), 1)
 
-
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ProfileNoteTest(unittest.TestCase):
     def test_empty_and_full(self):
         self.assertEqual(bench.profile_note({}), "")
@@ -312,3 +307,7 @@ class ProfileNoteTest(unittest.TestCase):
         self.assertIn("sample=5", note)
         self.assertIn("precision=fp16", note)
         self.assertIn("pre=2.00 inf=6.00 post=1.00 other=1.00", note)  # (500 - 450) ms / 50 images
+
+
+if __name__ == "__main__":
+    unittest.main()

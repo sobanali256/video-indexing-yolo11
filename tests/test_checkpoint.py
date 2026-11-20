@@ -390,5 +390,18 @@ class HFCheckpointTest(Base):
             self.ckpt([HFStore("me/ckpt", "r", api=api)]).snapshot(TIMERS)
 
 
+class FingerprintConfigTest(unittest.TestCase):
+    def test_baseline_config_matches_old_fingerprints(self):
+        old = make_fingerprint("/in", None, "results.jsonl", "r")
+        self.assertEqual(make_fingerprint("/in", None, "results.jsonl", "r",
+                                          config={"sample": 0, "precision": "fp32"}), old)
+
+    def test_other_config_differs(self):
+        a = make_fingerprint("/in", None, "results.jsonl", "r", config={"sample": 3, "precision": "fp16"})
+        b = make_fingerprint("/in", None, "results.jsonl", "r", config={"sample": 5, "precision": "fp16"})
+        self.assertNotEqual(a, b)
+        self.assertNotEqual(a, make_fingerprint("/in", None, "results.jsonl", "r"))
+
+
 if __name__ == "__main__":
     unittest.main()

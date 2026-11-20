@@ -27,6 +27,9 @@ FILES = PAYLOAD + ("manifest.json",)  # manifest last
 TIMER_KEYS = ("decode", "infer", "aggregate", "frames", "inferred_frames", "videos", "errors")
 
 
+BASELINE_CONFIG = {"sample": 0, "precision": "fp32"}  # settings of runs made before the fingerprint had a config
+
+
 class CheckpointError(RuntimeError):
     """A checkpoint cannot be used or would be overwritten; the run must not go on."""
 
@@ -38,9 +41,10 @@ def gen_name(n):
 def make_fingerprint(input_path, limit_videos, output, run_name, config=None):
     """What must be identical for a resume. The parquet files themselves are checked separately
     (Checkpointer.inputs_used), so files added to the input folder later do not matter.
-    config: settings that change the results (sampling, precision), so a resume never mixes them."""
+    config: settings that change the results (sampling, precision), so a resume never mixes them. It is
+    left out for the brute-force baseline (sample 0, fp32), so checkpoints made before it existed still match."""
     fp = {"input": str(input_path), "limit_videos": limit_videos, "output": Path(output).name, "run_name": run_name}
-    if config:
+    if config and config != BASELINE_CONFIG:
         fp["config"] = config
     return json.loads(json.dumps(fp))
 
@@ -303,7 +307,7 @@ class Checkpointer:
         if manifest["fingerprint"] != self.fingerprint:
             raise CheckpointError(
                 f"{store.label} holds a checkpoint of a different run (input path / --limit-videos / output name / "
-                "run name differ). Use another --run-name, or the same inputs and options."
+                "run name / --sample / --precision differ). Use another --run-name, or the same inputs and options."
             )
         used = manifest.get("inputs_used", {})
         for name, size in used.items():  # only files that were already processed matter

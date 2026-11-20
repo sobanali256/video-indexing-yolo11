@@ -263,6 +263,11 @@ class PendingInferenceFailureTest(unittest.TestCase):
         rows = [json.loads(x) for x in fr.text(out).splitlines()]
         return {r["video"]: r["error"] for r in rows if "error" in r}
 
+    def test_bad_sample_options_rejected(self):
+        with FakeRun(n_videos=2) as fr:
+            self.assertEqual(fr.main("r.jsonl", "--sample", "-1"), 2)
+            self.assertEqual(fr.main("r2.jsonl", "--sample", "3", "--dump-frames", str(fr.root / "d")), 2)
+
     def test_single_failure_followed_by_success_is_written_as_error_line_and_done(self):
         with FakeRun(n_videos=4, bad_calls={1}) as fr:
             self.assertEqual(fr.main("r.jsonl"), 0)

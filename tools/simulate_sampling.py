@@ -9,6 +9,8 @@ exact Fractions (t_num / t_den), so every frame lands in the same second as in t
     python tools/simulate_sampling.py ... --k 1,3,5,7 --adaptive 3:7,5:9 --json sim.json
 
 Only for the TUNE set (the holdout has no dumps, by design). FP16 effects are not simulated.
+Not simulated either: a video that fails decoding partway (its error line is copied from the reference and
+its dumped frames are grouped normally); the tune reference has no such video.
 """
 import argparse
 import json

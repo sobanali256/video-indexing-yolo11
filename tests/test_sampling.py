@@ -5,7 +5,7 @@ from fractions import Fraction as F
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from vidx.sampling import pick, sample_groups  # noqa: E402
+from vidx.sampling import MAX_GROUP, pick, sample_groups  # noqa: E402
 
 
 class PickTest(unittest.TestCase):
@@ -70,6 +70,11 @@ class SampleGroupsTest(unittest.TestCase):
             for _, tag in sample_groups(gen(), lambda x: x[0], 3):
                 got.append(tag)
         self.assertEqual(got, [1, 5, 8, 10, 12, 13])  # partial second 1 sampled before the error
+
+    def test_stuck_timestamps_are_capped(self):
+        items = [(F(0), i) for i in range(MAX_GROUP * 2 + 10)]  # pts never advance
+        got = self.run_sg(items, 1)
+        self.assertEqual(len(got), 3)  # groups of MAX_GROUP, MAX_GROUP, 10: memory stays bounded
 
     def test_failure_before_any_frame(self):
         def gen():

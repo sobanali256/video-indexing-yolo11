@@ -43,6 +43,36 @@ Deadline: **Sun 22 Nov 2026, 23:55 PKT**
 - [ ] Final secret scan + push before deadline
 
 ## Completed
+- 2026-11-20: **Code review #4 (Stage 0/1, commit 4626e7b)**, 6 findings, all fixed (164 tests pass):
+  - (important) Unbounded per-second buffer on broken timestamps → `MAX_GROUP = 240` frames per group in `vidx.sampling` (shared by simulator and pipeline; no effect on normal videos up to 240 fps).
+  - (important) The fingerprint config broke resume of older checkpoints → config is left out for the baseline (sample 0, fp32); the error message names --sample / --precision.
+  - (nit) `inferred_frames` is counted per successful batch.
+  - (nit) ProfileNoteTest moved above the main guard.
+  - (nit) `--sample < 0` and `--dump-frames` with `--sample > 0` are rejected (exit 2).
+  - (nit) The simulator docstring states that partial-failure videos are not simulated.
+- 2026-11-20: **Stage 0 profile (L4, 5 tune videos, 43,431 frames, clean):**
+  - Every frame, FP32: 99.3 fps. Per image: pre 1.58 ms (CPU letterbox), inference 7.32, post 0.67; decode 0.375 ms/frame.
+  - Every frame, **FP16: 155.3 fps** (inference 3.76 ms, 1.95x faster). FP16 alone vs reference: **F1 0.9995, exact 0.9981, within1 1.0000** (negligible loss).
+  - Decode only (`profile_decode`, 12 CPUs, FFmpeg auto threads): 5,304 fps; + BGR every frame 3,138 fps; + BGR for 5 frames/s 4,883 fps. Single thread 1,376 fps, so auto threading matters.
+  - Conclusion: even with sampling, the GPU stays the bottleneck on the L4. Model cost per inferred image ≈ 5.9 ms FP16 (of which ~1.5 ms is CPU letterbox) vs decode ≈ 0.2 ms per decoded frame.
+  - Sequential estimate per decoded frame: k=5 ≈ 1.27 ms (~4.6 h for 50 files); k=3 ≈ 0.85 ms (~3.1 h).
+  - Stage 2a (decode + letterbox in a prefetch thread, direct tensors) should give roughly another 1.5x.
+  - Bench note: `--only-common` gives PARTIAL, which bench logs as `fail_accuracy`; expected for profile runs.
+  - **Decision (by plan rule: cheapest accepted setting):** k=3 + FP16. Ladder fixed: k=3 → k=5 → every frame FP16 → every frame FP32.
+- 2026-11-20: **Sampling simulator on tune** (33 videos, 253,918 frames, 9,144 s; k=0 sanity check 1.0/1.0/1.0). Columns: inferred fraction / F1 / exact / within1:
+  - k=1 0.036 / 0.9775 / 0.9301 / 0.9913 (not accepted)
+  - k=2 0.072 / 0.9657 / 0.9190 / 0.9922 (not accepted)
+  - **k=3 0.108 (9.3x) / 0.9880 / 0.9584 / 0.9988 (accepted)**
+  - k=4 0.144 / 0.9825 / 0.9475 / 0.9968 (not accepted)
+  - **k=5 0.180 (5.6x) / 0.9911 / 0.9705 / 0.9992 (accepted)**
+  - k=6 0.216 / 0.9881 / 0.9630 / 0.9983 (accepted)
+  - k=7 0.252 (4.0x) / 0.9929 / 0.9738 / 0.9993 (accepted)
+  - k=9 0.324 / 0.9947 / 0.9776 / 0.9999 (accepted)
+  - adaptive 3:7 0.158 / 0.9929 / 0.9751 / 0.9996 (accepted)
+  - **adaptive 3:9 0.158 (6.3x) / 0.9947 / 0.9777 / 0.9999 (accepted)**
+  - adaptive 5:9 0.254 / 0.9943 / 0.9795 / 0.9998 (accepted)
+
+  Odd k clearly beats even k (vote ties / median of an even count). Every strategy passes the grader thresholds, even k=1. The weak videos are the same across strategies: people exact in videos 13, 5, 30; F1 in 15 and 20. k=3 has the thinnest F1 headroom (0.988 vs the 0.985 acceptance). Choice between k=3 and k=5 waits for the Stage 0 profile: if decode dominates after sampling, k=5 costs little extra time. Adaptive (N4) stays dropped unless fixed k fails.
 - 2026-11-20: **Stage 0 + Stage 1 code (not yet run on Colab):**
   - `vidx/sampling.py`: `pick(n, k)` (evenly spaced centres; all frames if n <= k or k <= 0), `iter_groups` (a group closes when int(t) changes; on a decode error the buffered group is yielded, then the error re-raised = blocker B1), `sample_groups`.
   - `vidx/decode.py`: `decode_video(data, sample=0, counter=None)` decodes and stamps every frame, converts only the sampled ones, counts decoded frames.
