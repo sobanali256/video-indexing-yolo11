@@ -89,3 +89,72 @@ def infer(model, frames, classes=COCO_IDS):
             d = r.boxes.data.cpu()  # one transfer: columns x1 y1 x2 y2 conf cls
             out.append(summarize(d[:, 5].tolist(), d[:, 4].tolist()))
     return out
+
+
+# ---------------------------------------------------------------- direct path (Stage 2a)
+# predict() letterboxes every image on the calling thread and re-runs setup_source on every call. The
+# direct path lets decode threads letterbox (Ultralytics' own LetterBox, same arguments the predictor
+# uses) and runs the predictor's own AutoBackend + NMS with the predictor's own arguments.
+
+def prepare_direct(model):
+    """Run predict() once so Ultralytics builds its predictor (fused AutoBackend, fp16 if requested, warmup),
+    then keep what the direct path needs. Must be called before make_letterbox / infer_tensor."""
+    import numpy as np
+
+    dummy = np.zeros((IMGSZ * 9 // 16, IMGSZ, 3), dtype=np.uint8)
+    infer(model, [dummy])
+    p = model.yolo.predictor
+    model.direct = {
+        "backend": p.model,
+        "args": p.args,
+        "imgsz": tuple(p.imgsz) if isinstance(p.imgsz, (list, tuple)) else (p.imgsz, p.imgsz),
+        "stride": p.model.stride,
+    }
+    a = p.args
+    log_args = (a.conf, a.iou, a.classes, a.agnostic_nms, a.max_det, p.model.fp16, model.direct["imgsz"])
+    return log_args
+
+
+def make_letterbox(model):
+    """-> prepare(image): the predictor's letterbox for a batch of same-shape images (auto=True minimal
+    rectangle, as predict() uses for a .pt model or a dynamic engine). One per thread."""
+    from ultralytics.data.augment import LetterBox
+
+    d = model.direct
+    lb = LetterBox(d["imgsz"], auto=True, stride=d["stride"])
+    return lambda image: lb(image=image)
+
+
+def infer_tensor(model, images):
+    """images: list of letterboxed BGR uint8 arrays of one shape. Same preprocessing as
+    BasePredictor.preprocess (BGR->RGB, BCHW, to device, half/float, /255), the predictor's own
+    backend, and DetectionPredictor.postprocess's NMS call with the predictor's args."""
+    import numpy as np
+    import torch
+    from ultralytics.utils import ops
+
+    d = model.direct
+    backend, a = d["backend"], d["args"]
+    t0 = time.perf_counter()
+    with torch.inference_mode():
+        x = torch.from_numpy(np.stack(images)).to(backend.device)
+        x = x[..., [2, 1, 0]].permute(0, 3, 1, 2).contiguous()  # BGR->RGB, BHWC->BCHW
+        x = x.half() if backend.fp16 else x.float()
+        x /= 255
+        preds = backend(x)
+        dets = ops.non_max_suppression(
+            preds, a.conf, a.iou, a.classes, a.agnostic_nms, max_det=a.max_det,
+            nc=len(backend.names), end2end=getattr(backend, "end2end", False), rotated=False,
+        )
+        out = []
+        for det in dets:
+            if det is None or len(det) == 0:
+                out.append(summarize([], []))
+            else:
+                c = det.cpu()  # columns x1 y1 x2 y2 conf cls
+                out.append(summarize(c[:, 5].tolist(), c[:, 4].tolist()))
+    sp = model.speed
+    sp["predict_wall_s"] += time.perf_counter() - t0
+    sp["predict_calls"] += 1
+    sp["images"] += len(images)
+    return out

@@ -26,6 +26,7 @@ MAX_INFERENCE_FAILURES = 3
 # holdout F1 0.9901 / exact 0.9683 / within1 0.9990 (accept bar 0.985 / 0.93 / 0.985).
 DEFAULT_SAMPLE = 3  # frames per second sent to the model; 0 = every frame (brute force)
 DEFAULT_PRECISION = "fp16"
+DEFAULT_DECODE_THREADS = 0  # 0 = sequential decode -> predict() per video; N > 0 = vidx.pipeline (Stage 2a)
 
 
 class Record(NamedTuple):
@@ -222,6 +223,58 @@ def process_video(video_id, data, infer_fn, args, timers):
     return lines
 
 
+def iter_videos(files, args, writer, ckpt, iter_rows):
+    """(video_id, data, err) of every video still to do, in sorted file/row order. --limit-videos counts
+    the first N videos including ones skipped because they are already done."""
+    seen = 0
+    for path in files:
+        if args.limit_videos is not None and seen >= args.limit_videos:
+            return
+        for video_id, data, err in iter_rows(path):
+            if args.limit_videos is not None and seen >= args.limit_videos:
+                return
+            seen += 1
+            if writer.is_done(video_id):
+                if ckpt:
+                    ckpt.note_input(path.name)
+                continue
+            yield video_id, data, err
+
+
+def sequential_results(videos, infer_fn, args, timers):
+    """One video at a time (decode, then predict() in batches). Yields (kind, video_id, payload, batch_no):
+    ("ok", id, lines, None), ("source_error", id, lines, None) or ("fail", id, message, unique_no).
+    batch_no None on "ok" means "inferred after every earlier failure" (strict video order)."""
+    failures = 0
+    for video_id, data, err in videos:
+        if err:
+            yield "source_error", video_id, [error_line(video_id, err)], None
+            continue
+        try:
+            lines = process_video(video_id, data, infer_fn, args, timers)
+        except InferenceError as e:
+            failures += 1
+            yield "fail", video_id, str(e), failures
+            continue
+        yield "ok", video_id, lines, None
+
+
+def pipeline_results(videos, model, args, timers):
+    """Stage 2a: decode threads + cross-video batches + direct tensor inference (vidx.pipeline)."""
+    from vidx.decode import decode_video
+    from vidx.model import infer_tensor, make_letterbox, prepare_direct
+    from vidx.pipeline import Pipeline
+
+    log.info("direct path: conf, iou, classes, agnostic, max_det, fp16, imgsz = %s", prepare_direct(model))
+
+    def decode_fn(data, counter):
+        return decode_video(data, sample=args.sample, counter=counter)
+
+    pipe = Pipeline(videos, decode_fn, lambda: make_letterbox(model), lambda imgs: infer_tensor(model, imgs),
+                    args.batch, args.decode_threads, timers, run_inference, video_lines)
+    yield from pipe.run()
+
+
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(description="Per-second object indexing with YOLO11l")
     ap.add_argument("--input", required=True, help="folder of .parquet files (or one file)")
@@ -231,6 +284,9 @@ def parse_args(argv=None):
                     help=f"frames per second sent to the model, evenly spaced; 0 = every frame (default {DEFAULT_SAMPLE})")
     ap.add_argument("--precision", choices=["fp16", "fp32"], default=DEFAULT_PRECISION,
                     help=f"model precision on the GPU (default {DEFAULT_PRECISION})")
+    ap.add_argument("--decode-threads", type=int, default=DEFAULT_DECODE_THREADS, metavar="N",
+                    help="N > 0: decode/letterbox in N threads overlapped with inference, batches across videos; "
+                         f"0 = one video at a time (default {DEFAULT_DECODE_THREADS})")
     ap.add_argument("--resume", action="store_true", help="continue a previous run (uses <output>.done)")
     ap.add_argument("--limit-videos", type=int, default=None, help="only the first N videos")
     ap.add_argument("--dump-frames", default=None, metavar="DIR", help="save per-frame npz per video")
@@ -317,6 +373,12 @@ def _main(args, stats):
     if args.sample < 0:
         print("--sample must be >= 0 (0 = every frame)", file=sys.stderr)
         return 2
+    if args.decode_threads < 0:
+        print("--decode-threads must be >= 0", file=sys.stderr)
+        return 2
+    if args.dump_frames and args.decode_threads > 0:
+        print("--dump-frames is only supported with --decode-threads 0", file=sys.stderr)
+        return 2
     if args.dump_frames and args.sample > 0:
         print("--dump-frames needs every frame (--sample 0): the sampling simulator treats dumps as every-frame",
               file=sys.stderr)
@@ -369,8 +431,8 @@ def _main(args, stats):
         log.info("resuming: %d videos already done", len(writer.done))
     start = time.perf_counter()
     stats["startup_s"] = start - _PROCESS_START
-    seen = 0
     pending = []  # (video_id, message) of videos whose inference failed: written only once we know the model still works
+    failed_batches = set()  # failed batch ids since the last success ("3 in a row" counts batches)
 
     def record(video_id, lines):
         timers.videos += 1
@@ -384,42 +446,39 @@ def _main(args, stats):
         for video_id, message in pending:
             record(video_id, [error_line(video_id, f"inference failed: {message}")])
         pending.clear()
+        failed_batches.clear()
+
+    videos = iter_videos(files, args, writer, ckpt, iter_rows)
+    if args.decode_threads > 0:
+        results = pipeline_results(videos, model, args, timers)
+    else:
+        results = sequential_results(videos, infer_fn, args, timers)
 
     try:
-        for path in files:
-            if args.limit_videos is not None and seen >= args.limit_videos:
-                break
-            for video_id, data, err in iter_rows(path):
-                if args.limit_videos is not None and seen >= args.limit_videos:
-                    break
-                seen += 1
-                if writer.is_done(video_id):
-                    if ckpt:
-                        ckpt.note_input(path.name)
-                    continue
-                if err:
-                    lines = [error_line(video_id, err)]
-                else:
-                    try:
-                        lines = process_video(video_id, data, infer_fn, args, timers)
-                    except InferenceError as e:
-                        pending.append((video_id, str(e)))
-                        log.error("%s: inference failed, not recorded yet (%d in a row): %s",
-                                  video_id, len(pending), e)
-                        if len(pending) >= MAX_INFERENCE_FAILURES:  # pending ones stay unwritten: --resume retries them
-                            print(f"aborting: {len(pending)} videos in a row failed in inference "
-                                  f"(last: {e}). Restart the runtime and re-run with --resume.",
-                                  file=sys.stderr)
-                            return 3
-                        continue
-                    write_pending()  # the model works again, so those earlier failures were video-specific
-                record(video_id, lines)
-                if timers.videos % 10 == 0:
-                    log.info("%s | %s", video_id, timers.summary(time.perf_counter() - start))
-                if ckpt:
-                    ckpt.maybe_snapshot(timers)
+        for kind, video_id, payload, batch_no in results:
+            if kind == "fail":
+                pending.append((video_id, payload))
+                failed_batches.add(batch_no)
+                log.error("%s: inference failed, not recorded yet (%d failed batches in a row): %s",
+                          video_id, len(failed_batches), payload)
+                if len(failed_batches) >= MAX_INFERENCE_FAILURES:  # pending ones stay unwritten: --resume retries them
+                    print(f"aborting: {len(failed_batches)} batches in a row failed in inference "
+                          f"(last: {payload}). Restart the runtime and re-run with --resume.",
+                          file=sys.stderr)
+                    return 3
+                continue
+            # the model works again (a batch newer than every failed one succeeded), so those earlier failures
+            # were video-specific. A pipeline result inferred before a failure proves nothing.
+            if kind == "ok" and (batch_no is None or not failed_batches or batch_no > max(failed_batches)):
+                write_pending()
+            record(video_id, payload)
+            if timers.videos % 10 == 0:
+                log.info("%s | %s", video_id, timers.summary(time.perf_counter() - start))
+            if ckpt:
+                ckpt.maybe_snapshot(timers)
         write_pending()  # normal end: nothing followed them, record them as errors
     finally:
+        results.close()  # stops pipeline threads on an early return / exception
         stats["loop_s"] = time.perf_counter() - start
         writer.close()
         if ckpt:

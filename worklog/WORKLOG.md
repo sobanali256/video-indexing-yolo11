@@ -43,6 +43,20 @@ Deadline: **Sun 22 Nov 2026, 23:55 PKT**
 - [ ] Final secret scan + push before deadline
 
 ## Completed
+- 2026-11-20: **Stage 2a code (off by default, `--decode-threads N`; not yet run on a GPU):**
+  - `vidx/pipeline.py`: N decode threads (decode + sample + rotate + letterbox) feed a bounded queue. The main thread buckets frames by letterboxed shape across videos and runs a bucket when it is full or the queue runs dry. A video is emitted once its END has arrived and no frame of it waits in a bucket.
+  - `vidx/model.py`: `prepare_direct` (one predict() call, then the predictor's own AutoBackend + args), `make_letterbox` (Ultralytics LetterBox, auto=True, the predictor's stride/imgsz), `infer_tensor` (BGR→RGB, BCHW, half/float, /255, the predictor's NMS args).
+  - `run.py`: `iter_videos` / `sequential_results` / `pipeline_results`, one shared result loop (pending / 3-failed-batches / exit 3 kept).
+  - **Code review #5** (7 findings, all fixed):
+    - a letterbox setup error in a thread would hang the run → `make_prepare` moved inside try/finally, and the run raises once all threads have failed;
+    - a stale "ok" (inferred before a failed batch) cleared pending → "ok" carries `last_batch`, and only a batch newer than every failed one clears pending;
+    - an error from the shared iterator was swallowed (exit 0, videos missing) → stored and re-raised on the main thread;
+    - speedup.ipynb profile cells now pass `--sample 0`;
+    - resume without a checkpoint could mix settings → `<output>.config.json` (in commit c711611);
+    - pipeline decode time excludes time blocked on the queue (sum over threads);
+    - README documents `--decode-threads` as EXPERIMENTAL.
+  - Tests: 179 pass. Stage 1 was committed separately (c711611) and its snapshot tested alone (167 pass).
+  - **Next:** GPU check of the direct path vs predict() (FP32 bit-identical expected, FP16 >= 0.999), then a timing run with `--decode-threads 1/2` on tune, then the margin check on tune + holdout.
 - 2026-11-20: **Stage 1 gate PASSED (k=3 + FP16)**. Colab gave a **Tesla T4** after the reset (not the L4), so these speeds are not comparable with the L4 baseline.
   - k=3 FP32 tune (pipeline vs simulator check): F1 0.9879 / exact 0.9586 / within1 0.9989 vs simulator 0.9880 / 0.9584 / 0.9988. Off by about 1–2 seconds out of 9,144, not bit-identical. Consistent with batch composition / GPU (T4 vs the L4 reference) flipping conf ~0.4 detections (batch_agreement already showed < 0.1% such frames). Not a sampling bug: the inferred frames (27,431 = 0.108) match the simulator's fraction exactly. clean=no (download running).
   - **k=3 FP16 tune: F1 0.9877, exact 0.9586, within1 0.9989** → accepted (bar 0.985 / 0.93 / 0.985). T4: 544.9 decoded fps; decode 201 s, infer 261 s of 466 s; per image inf 7.04 ms, pre 1.52, post 0.80.
