@@ -26,7 +26,10 @@ MAX_INFERENCE_FAILURES = 3
 # holdout F1 0.9901 / exact 0.9683 / within1 0.9990 (accept bar 0.985 / 0.93 / 0.985).
 DEFAULT_SAMPLE = 3  # frames per second sent to the model; 0 = every frame (brute force)
 DEFAULT_PRECISION = "fp16"
-DEFAULT_DECODE_THREADS = 0  # 0 = sequential decode -> predict() per video; N > 0 = vidx.pipeline (Stage 2a)
+# Stage 2a gate passed 2026-11-20 (L4): direct path == predict() (1.0000, fp32 and fp16); tune 1,900 fps with
+# 2 threads (1,214 with 0) at identical accuracy; holdout F1 0.9902 / exact 0.9680 / within1 0.9990.
+# 2 threads: no cost on the L4 (GPU-bound) and decode headroom for a faster GPU.
+DEFAULT_DECODE_THREADS = 2  # 0 = sequential decode -> predict() per video; N > 0 = vidx.pipeline (Stage 2a)
 
 
 class Record(NamedTuple):
@@ -260,12 +263,11 @@ def sequential_results(videos, infer_fn, args, timers):
 
 
 def pipeline_results(videos, model, args, timers):
-    """Stage 2a: decode threads + cross-video batches + direct tensor inference (vidx.pipeline)."""
+    """Stage 2a: decode threads + cross-video batches + direct tensor inference (vidx.pipeline).
+    Call only after vidx.model.prepare_direct(model) succeeded."""
     from vidx.decode import decode_video
-    from vidx.model import infer_tensor, make_letterbox, prepare_direct
+    from vidx.model import infer_tensor, make_letterbox
     from vidx.pipeline import Pipeline
-
-    log.info("direct path: conf, iou, classes, agnostic, max_det, fp16, imgsz = %s", prepare_direct(model))
 
     def decode_fn(data, counter):
         return decode_video(data, sample=args.sample, counter=counter)
@@ -341,6 +343,7 @@ def write_stats(path, stats, timers, exit_code, argv):
             "startup_s": stats.get("startup_s"),
             "sample": stats.get("sample"),
             "precision": stats.get("precision"),
+            "decode_threads": stats.get("decode_threads"),
             "model_speed": stats.get("model_speed"),
             "exit_code": exit_code,
             "argv": list(argv),
@@ -449,7 +452,17 @@ def _main(args, stats):
         failed_batches.clear()
 
     videos = iter_videos(files, args, writer, ckpt, iter_rows)
-    if args.decode_threads > 0:
+    threads = args.decode_threads
+    if threads > 0:
+        try:
+            from vidx.model import prepare_direct
+
+            log.info("direct path: conf, iou, classes, agnostic, max_det, fp16, imgsz = %s", prepare_direct(model))
+        except Exception as e:  # the faster path may cost speed, never the run: fall back to predict() per video
+            log.warning("direct path unavailable (%s: %s): falling back to --decode-threads 0", type(e).__name__, e)
+            threads = 0
+    stats["decode_threads"] = threads
+    if threads > 0:
         results = pipeline_results(videos, model, args, timers)
     else:
         results = sequential_results(videos, infer_fn, args, timers)

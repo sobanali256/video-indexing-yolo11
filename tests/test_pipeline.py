@@ -179,6 +179,23 @@ class RunMainPipelineTest(unittest.TestCase):
             vids = [json.loads(x)["video"] for x in fr.text("r.jsonl").splitlines()]
             self.assertEqual(sorted(set(vids)), [f"a.parquet:{i}" for i in range(6)])
 
+    def test_direct_setup_failure_falls_back_to_sequential(self):
+        import vidx.model
+
+        with FakeRun(n_videos=4) as fr:
+            saved = self.patch_direct(fr)
+
+            def broken(model):
+                raise RuntimeError("no predictor")
+
+            vidx.model.prepare_direct = broken
+            try:
+                self.assertEqual(fr.main("seq.jsonl"), 0)
+                self.assertEqual(fr.main("fb.jsonl", "--decode-threads", "2"), 0)
+            finally:
+                self.restore(saved)
+            self.assertEqual(self.lines(fr, "seq.jsonl"), self.lines(fr, "fb.jsonl"))
+
     def test_dump_frames_rejected_with_threads(self):
         with FakeRun(n_videos=2) as fr:
             self.assertEqual(fr.main("r.jsonl", "--decode-threads", "2", "--dump-frames", str(fr.root / "d")), 2)

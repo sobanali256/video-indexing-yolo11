@@ -2,7 +2,7 @@
 
 Per-second object indexing of FineVideo with Ultralytics YOLO11l (person, car, dog, laptop, cell phone + people count), optimised for speed.
 
-> Work in progress: the current `run.py` is the correct every-frame baseline. The performance section will be filled in once the speed-ups are validated.
+> Work in progress: the performance section will be filled in after the full run. Validated so far (L4): 3 sampled frames per second + FP16 + 2 decode threads, ~18x faster than every-frame brute force at F1 0.99 / people exact 0.96-0.97 / within +-1 0.999 on the tune and holdout references.
 
 ## Install (Ubuntu 22.04, Python 3.11, CUDA 12)
 ```
@@ -22,7 +22,7 @@ python prepare.py
 python run.py --input <folder of .parquet files> --output results.jsonl
 ```
 Defaults: 3 evenly spaced frames per second go to the model (`--sample 3`; every frame is still decoded and timestamped) in FP16 (`--precision fp16`). `--sample 0 --precision fp32` is the brute-force reference.
-Optional flags: `--batch 32`, `--resume` (continue an interrupted run via `results.jsonl.done`), `--limit-videos N`, `--dump-frames DIR` (per-frame npz for offline experiments; needs `--sample 0`), `--decode-threads N` (EXPERIMENTAL, off by default until it passes `score.py` against the reference: decode/letterbox in N threads overlapped with direct inference, batches across videos; not with `--dump-frames`).
+Optional flags: `--batch 32`, `--resume` (continue an interrupted run via `results.jsonl.done`), `--limit-videos N`, `--dump-frames DIR` (per-frame npz for offline experiments; needs `--sample 0`), `--decode-threads N` (default 2: decode/letterbox in N threads overlapped with inference, batches across videos; 0 = one video at a time through `predict()`; not with `--dump-frames`).
 A run writes `<output>.config.json` (sample, precision); `--resume` refuses to continue an output made with other settings. Stage timings (decode / infer / aggregate / total) are printed to stderr.
 
 Durable checkpoints for long runs on a machine whose disk can be wiped (Colab). Off unless a flag is given; the plain command above is unchanged.

@@ -3,6 +3,7 @@
 Deadline: **Sun 22 Nov 2026, 23:55 PKT**
 
 ## Next up
+- **(2026-11-20 evening) Stages 1 + 2a validated; defaults k=3 + FP16 + 2 decode threads (tag `results-v1`).** Next: full 50-file run on the L4 (speedup.ipynb section 5), then results.jsonl.gz into the repo, HARDWARE.md, README performance. Stage 3 (TensorRT) only after the deliverables are safe; any new default needs a re-run.
 - **(2026-11-20) Speed-up plan APPROVED:** `worklog/plans/2026-11-20-speedup-plan.md`. Margin: F1 >= 0.98, exact >= 0.92, within1 >= 0.98 on tune AND holdout. Stages: 0 profile -> 1 sampling (offline simulator on tune dumps) + FP16 -> 2a decode workers + mp queue + cross-video batching + direct-tensor infer (2b shared memory only if profiling says so) -> 3 TensorRT if time. Schedule: Sat morning re-download 50 files + offline-run test; **Sat night launch full 50-file run** with best validated stage, tag that commit (defaults = results config); Sun deliverables + user writes WRITEUP.md (2-3 h). Independent review done (2 blockers, 9 important; all folded into the plan's 'Amendments' section). User decisions: FP16 allowed if it passes the margin (note in write-up); Stage 2a threads-first in one process; start the 50-file download tonight. Next action: check `$DRIVE/frames` has 33 npz, start the download, then Stage 0 + 1a executed with Sonnet.
 0. **Where we stopped (2026-11-20):** Colab (website, not the VS Code extension — it was buggy) session reached step 11 "Checks"; the cell had been running > 30 min. Collect from the user: the `bench_log.csv` "brute force baseline" row, machine check output, and whatever the checks cell printed. Then investigate the slow checks (open issue #8).
 1. (done) code review of 2026-11-20 changes; commits 4009eeb, 17a55b9 (MPLBACKEND fix, Colab website), f3e3b60 (single `--include` for the 3 reference files).
@@ -43,6 +44,18 @@ Deadline: **Sun 22 Nov 2026, 23:55 PKT**
 - [ ] Final secret scan + push before deadline
 
 ## Completed
+- 2026-11-20: **Stage 2a gate PASSED (L4)**, defaults now k=3 + FP16 + **2 decode threads**:
+  - 4.1 direct path vs predict(): identical counts **1.0000, max conf gap 0.00000** in FP32 and FP16 (1,000 frames, 32 batches); predictor args conf 0.4, iou 0.7, classes [0,2,16,63,67], agnostic False, max_det 300, imgsz (640, 640).
+  - 4.2 tune (all F1 0.9878, exact 0.9588, within1 0.9989):
+    - threads 0 (Stage 1 path): **1,214 fps** (infer 159 s, decode 49 s, loop 209 s)
+    - threads 1: **1,934 fps** (loop 131 s, infer 128 s)
+    - threads 2: **1,900 fps** (loop 134 s)
+    - GPU-bound now (infer ≈ loop), per inferred image ~4.7 ms. **18.6x vs brute force on the same L4** (103.9 fps).
+  - 4.3 holdout, threads 2: **F1 0.9902, exact 0.9680, within1 0.9990**, 1,899 fps.
+  - Default 2 threads: no cost on the L4 and decode headroom on the 4090 (GPU ~2.5x faster; 1 thread would become decode-bound). Stage 2b (shared memory) is not needed.
+  - Robustness: if `prepare_direct` fails at startup, run.py logs a warning and falls back to `--decode-threads 0` (test added). Stats JSON records `decode_threads`. FakeRun tests pin `--decode-threads 0` (the pipeline has its own tests). 180 tests pass.
+  - speedup.ipynb section 5: full 50-file run (5.1 download check, 5.2 launch in the background with default flags + Drive checkpoints, 5.3 progress, 5.4 resume, 5.5 schema + sanity scores + gzip to Drive + total time). Projection on the L4: 12.98 M frames / ~1,900 fps ≈ **1.9 h** (vs 34.7 h brute force).
+  - Bench note: with the direct path, `ms/img pre/inf/post` show 0 and everything lands in "other" (infer_tensor does not split the time); cosmetic.
 - 2026-11-20: Stage 2a GPU checks prepared:
   - `tools/batch_agreement.py --direct --precision fp32|fp16`: predict() vs the direct path on the same frames and batches.
   - speedup.ipynb section 4: 4.1 agreement, 4.2 tune timing with threads 0/1/2 (labels include the GPU name), 4.3 holdout.

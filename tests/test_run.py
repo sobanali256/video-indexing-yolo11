@@ -252,6 +252,10 @@ class FakeRun:
         self.tmp.cleanup()
 
     def main(self, out, *extra):
+        """These tests exercise the sequential path (one infer call per video); the threaded pipeline (the
+        default) is covered by tests/test_pipeline.py, which passes --decode-threads explicitly."""
+        if "--decode-threads" not in extra:
+            extra = (*extra, "--decode-threads", "0")
         return run.main(["--input", str(self.root / "in"), "--output", str(self.root / out), *extra])
 
     def text(self, out):
@@ -390,7 +394,7 @@ class CheckpointMainTest(unittest.TestCase):
 
 class StatsJsonTest(unittest.TestCase):
     KEYS = {"videos", "errors", "frames", "inferred_frames", "decode_s", "infer_s", "aggregate_s", "loop_s", "startup_s",
-            "sample", "precision", "model_speed",
+            "sample", "precision", "model_speed", "decode_threads",
             "exit_code", "argv"}
 
     def stats(self, fr, name="s.json"):
