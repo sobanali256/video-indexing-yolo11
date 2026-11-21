@@ -201,5 +201,30 @@ class RunMainPipelineTest(unittest.TestCase):
             self.assertEqual(fr.main("r.jsonl", "--decode-threads", "2", "--dump-frames", str(fr.root / "d")), 2)
 
 
+class AutoDecodeThreadsTest(unittest.TestCase):
+    def test_scales_with_cpus_and_is_capped(self):
+        self.assertEqual([run.auto_decode_threads(c) for c in (1, 2, 8, 11, 12, 16, 32, 64)], [2, 2, 2, 2, 3, 4, 4, 4])
+
+    def test_argument_parsing(self):
+        self.assertEqual(run.parse_args(["--input", "i", "--output", "o"]).decode_threads, "auto")
+        self.assertEqual(run.parse_args(["--input", "i", "--output", "o", "--decode-threads", "AUTO"]).decode_threads,
+                         "auto")
+        self.assertEqual(run.parse_args(["--input", "i", "--output", "o", "--decode-threads", "3"]).decode_threads, 3)
+        for bad in ("-1", "x"):
+            with self.assertRaises(SystemExit):
+                run.parse_args(["--input", "i", "--output", "o", "--decode-threads", bad])
+
+    def test_auto_resolves_to_a_number_in_stats(self):
+        with FakeRun(n_videos=3) as fr:
+            saved = RunMainPipelineTest.patch_direct(self, fr)
+            try:
+                path = str(fr.root / "s.json")
+                self.assertEqual(fr.main("r.jsonl", "--decode-threads", "auto", "--stats-json", path), 0)
+            finally:
+                RunMainPipelineTest.restore(self, saved)
+            d = json.loads((fr.root / "s.json").read_text(encoding="utf-8"))
+            self.assertEqual(d["decode_threads"], run.auto_decode_threads())
+
+
 if __name__ == "__main__":
     unittest.main()

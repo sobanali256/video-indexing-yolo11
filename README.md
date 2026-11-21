@@ -31,7 +31,7 @@ Where the speed comes from (each step measured on the L4 against the reference):
 ## How it works
 ```
 parquet files -> video rows (--resume skips videos already done)
-  decode threads (2):  decode EVERY frame (PyAV) -> exact timestamp -> group by second
+  decode threads (auto, 2-4): decode EVERY frame (PyAV) -> exact timestamp -> group by second
                        -> keep 3 evenly spaced frames per second (all if a second has <= 3)
                        -> rotate if the video has a rotation tag -> Ultralytics LetterBox (640, minimal rectangle)
   main thread (GPU):   batches of 32 frames of one letterboxed shape, mixed across videos
@@ -45,15 +45,20 @@ parquet files -> video rows (--resume skips videos already done)
 - Model rules kept: official `yolo11l.pt`, imgsz 640, conf 0.4, Ultralytics defaults otherwise (aspect-preserving letterbox,
   class-aware NMS IoU 0.7, BGR frames), rotation applied before inference.
 
-## Install (Ubuntu 22.04, Python 3.11, CUDA 12)
+## Install (Ubuntu 22.04, Python 3.11, NVIDIA driver >= 525 for CUDA 12)
 ```
-sudo apt-get install -y libgl1 libglib2.0-0     # runtime libs for OpenCV
+git clone https://github.com/sobanali256/video-indexing-yolo11.git && cd video-indexing-yolo11
+sudo apt-get update
+sudo apt-get install -y libgl1 libglib2.0-0          # runtime libs for OpenCV (PyAV wheels bundle FFmpeg)
+sudo apt-get install -y python3.11 python3.11-venv   # only if Python 3.11 is not installed (Ubuntu 22.04 ships 3.10)
 python3.11 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
+Already have a Python 3.11 environment? `pip install -r requirements.txt` in it is enough. The install needs ~5 GB of
+disk (PyTorch + CUDA wheels); torch 2.6.0 cu126 wheels run on any NVIDIA driver >= 525 (CUDA 12 minor-version compatibility).
 
 ## Prepare (untimed, needs internet)
-Downloads `yolo11l.pt` next to `run.py` and loads it once to check it works.
+Downloads `yolo11l.pt` next to `run.py` and runs it once on the GPU to check it works (prints the device it used).
 ```
 python prepare.py
 ```
@@ -62,6 +67,8 @@ python prepare.py
 ```
 python run.py --input <folder of .parquet files> --output results.jsonl
 ```
+Run from any directory (paths are resolved from `run.py`). Expected time: ~1,900 video frames/s on an NVIDIA L4, i.e.
+~12 min for 13 h of 30 fps video; progress and timings are logged to stderr every 10 videos.
 Output: JSON Lines, one line per video second, e.g.
 `{"video": "train-00003-of-01357.parquet:4", "second": 12, "objects": ["person", "laptop"], "people": 2}`.
 A video that cannot be decoded gives one `{"video": ..., "error": ...}` line; if it fails partway, the seconds decoded
@@ -71,11 +78,11 @@ before the error are kept and one error line is appended. One bad video never st
 |---|---|---|
 | `--sample K` | 3 | frames per second sent to the model; `0` = every frame (brute force) |
 | `--precision fp16\|fp32` | fp16 | model precision on the GPU |
-| `--decode-threads N` | 2 | decode/letterbox threads overlapped with inference; `0` = one video at a time through `predict()` |
+| `--decode-threads N` | auto | decode/letterbox threads overlapped with inference; `auto` = one per 4 CPUs, 2 to 4 (4 on a 32-thread machine); `0` = one video at a time through `predict()`. It changes speed only, not which frames are used |
 | `--batch B` | 32 | inference batch size (split in halves on CUDA out-of-memory) |
 | `--resume` | off | continue an interrupted run (uses `<output>.done`); refuses other `--sample`/`--precision` (`<output>.config.json`) |
 | `--limit-videos N` | all | only the first N videos |
-| `--dump-frames DIR` | off | per-frame npz for offline experiments (needs `--sample 0 --decode-threads 0`) |
+| `--dump-frames DIR` | off | per-frame npz for offline experiments (needs `--sample 0`; with `auto` threads it switches to `--decode-threads 0` by itself) |
 | `--stats-json PATH` | off | timing stats (frames, decode/infer time, settings) |
 
 Brute-force reference: `python run.py --input DIR --output ref.jsonl --sample 0 --precision fp32 --decode-threads 0`.

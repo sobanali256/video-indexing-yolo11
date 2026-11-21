@@ -3,6 +3,14 @@
 Deadline: **Sun 22 Nov 2026, 23:55 PKT**
 
 ## Next up
+- **STOP POINT 2026-11-20 (Fri night PKT): deliverables mostly done.**
+  - Pushed: f54e554 (results.jsonl.gz, HARDWARE.md, bench_log.csv; tag `full-run-v1`), 96b3dd0 (README rewrite). Code tag `results-v1` = cfd9662 (k=3, fp16, 2 decode threads).
+  - Remaining, in order:
+    1. **ai_chats/**: copy the full Claude Code `.jsonl` from `~/.claude/projects/D--video-indexing-yolo11/`, replace tokens with `[REMOVED]`, add web chat links to `ai_chats/links.txt`.
+    2. **Grader-machine checks** (pending list): offline run with no network (no download attempts, no crash); damaged input (truncated mp4, corrupt parquet → error lines, run continues); then the rotation check (`find_rotated`).
+    3. **WRITEUP.md: the user writes it** (2–3 h budget). The numbers are in this worklog + `worklog/bench_log.csv`.
+    4. Final secret scan + push before Sun 22 Nov 23:55 PKT.
+    5. Optional Stage 3 (TensorRT): only after 1–4; needs a full re-run (~2 h on the L4) + the tune/holdout gate + a new tag.
 - **(2026-11-20 evening) Stages 1 + 2a validated; defaults k=3 + FP16 + 2 decode threads (tag `results-v1`).** Full run DONE 2026-11-20 (1 h 52 min, 1,650 videos, 0 errors). Next: results.jsonl.gz into the repo, HARDWARE.md, README performance, ai_chats. Stage 3 (TensorRT) only after the deliverables are safe; any new default needs a re-run.
 - **(2026-11-20) Speed-up plan APPROVED:** `worklog/plans/2026-11-20-speedup-plan.md`. Margin: F1 >= 0.98, exact >= 0.92, within1 >= 0.98 on tune AND holdout. Stages: 0 profile -> 1 sampling (offline simulator on tune dumps) + FP16 -> 2a decode workers + mp queue + cross-video batching + direct-tensor infer (2b shared memory only if profiling says so) -> 3 TensorRT if time. Schedule: Sat morning re-download 50 files + offline-run test; **Sat night launch full 50-file run** with best validated stage, tag that commit (defaults = results config); Sun deliverables + user writes WRITEUP.md (2-3 h). Independent review done (2 blockers, 9 important; all folded into the plan's 'Amendments' section). User decisions: FP16 allowed if it passes the margin (note in write-up); Stage 2a threads-first in one process; start the 50-file download tonight. Next action: check `$DRIVE/frames` has 33 npz, start the download, then Stage 0 + 1a executed with Sonnet.
 0. **Where we stopped (2026-11-20):** Colab (website, not the VS Code extension — it was buggy) session reached step 11 "Checks"; the cell had been running > 30 min. Collect from the user: the `bench_log.csv` "brute force baseline" row, machine check output, and whatever the checks cell printed. Then investigate the slow checks (open issue #8).
@@ -44,6 +52,16 @@ Deadline: **Sun 22 Nov 2026, 23:55 PKT**
 - [ ] Final secret scan + push before deadline
 
 ## Completed
+- 2026-11-21: **Full review with 3 independent subagents** (brief compliance, code correctness, setup/offline). No code blockers; 180 tests pass. The direct path, timestamps, sampling, aggregation and threading were confirmed correct against the reference semantics; `YOLO_OFFLINE` is honoured in 8.3.100 and nothing downloads at run time.
+  - Gaps found: HARDWARE.md lacks OS and disk type (brief asks for both); README lacked `apt-get update`, `git clone`/`cd`, the Python 3.11 / venv apt line and the driver note; requirements.txt had a stale PROVISIONAL note and pins only direct dependencies; rotation, offline and damaged-input checks were never run.
+  - Decision items reported to the user: decode threads on the 4090 (likely decode-bound with 2), FP16 wording ("Ultralytics defaults"), exit 3 after 3 failed batches (kept).
+  - Fixed (A): README install (clone, apt-get update, python3.11-venv, driver >= 525, disk note, run time), prepare/run notes; requirements note; HARDWARE OS/disk rows added as TO CONFIRM (Colab 6.1).
+- 2026-11-21: **Performance-only change after results-v1: `--decode-threads auto` (new default)** = one thread per 4 CPUs, 2..4 (`run.auto_decode_threads`; 3 on Colab's 12 vCPUs, 4 on the 32-thread grader). It only changes how frames reach the GPU, not which frames. It must give byte-identical sorted output vs 2 threads (Colab 6.2, PENDING); no re-run of the 50 files. Tests added (auto values, arg parsing, stats).
+- 2026-11-21: New checks for Colab section 6:
+  - `tools/rotation_check.py`: our decoder vs ffmpeg autorotate on 90/180/270 copies of a real video;
+  - `tools/make_damaged.py`: truncated / random / null / empty mp4, zeroed block, corrupt + truncated parquet, plus a checker with tests;
+  - 6.5 offline run (all socket connects blocked via sitecustomize, plus `unshare -n` if allowed);
+  - 6.6 clean plain-pip install in a fresh 3.11 venv + `pip freeze` to Drive.
 - 2026-11-20: **FULL 50-FILE RUN DONE (results-v1 = cfd9662, NVIDIA L4, Colab):**
   - 1,650 videos, 0 errors, 12,981,615 frames (matches count_frames exactly), 1,385,035 inferred (10.7%).
   - Wall 15:15:36 → 17:07:37 UTC (one session, no resets): compute 6,721.4 s = **1 h 52 min**; loop 6,718.2 s; startup 3.3 s; **1,932 fps**.
@@ -206,6 +224,7 @@ Deadline: **Sun 22 Nov 2026, 23:55 PKT**
 - #4 (2026-11-19) Decision made: commit the worklog in `worklog/`.
 
 ## Session log
+- 2026-11-20 (long session, Opus): baseline finished → plan + review → Stage 0/1/2a implemented, reviewed (#4–#6) and validated → full 50-file run (1 h 52 min, 18.6x) → deliverables committed and tagged.
 - 2026-11-19: Session "Alethia": repo setup.
 - 2026-11-19: Execution session (Sonnet): housekeeping + local code per the approved plan (steps 1-2). Colab steps not started.
 - 2026-11-20: Code review #3 (bench/score/count_frames), fixes:

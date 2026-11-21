@@ -29,7 +29,31 @@ DEFAULT_PRECISION = "fp16"
 # Stage 2a gate passed 2026-11-20 (L4): direct path == predict() (1.0000, fp32 and fp16); tune 1,900 fps with
 # 2 threads (1,214 with 0) at identical accuracy; holdout F1 0.9902 / exact 0.9680 / within1 0.9990.
 # 2 threads: no cost on the L4 (GPU-bound) and decode headroom for a faster GPU.
-DEFAULT_DECODE_THREADS = 2  # 0 = sequential decode -> predict() per video; N > 0 = vidx.pipeline (Stage 2a)
+# Performance-only change after results-v1 (2026-11-21): the default scales with the machine (see auto_decode_threads);
+# the thread count only changes how frames reach the GPU, not which frames or their results.
+DEFAULT_DECODE_THREADS = "auto"  # "auto", 0 = sequential decode -> predict() per video, N > 0 = vidx.pipeline
+MIN_AUTO_THREADS, MAX_AUTO_THREADS = 2, 4
+
+
+def auto_decode_threads(cpu_count=None):
+    """Decode threads for this machine: one per 4 CPUs, at least 2 (the validated setting), at most 4.
+    Each decoder also uses FFmpeg's own frame threads, so the cap avoids oversubscribing the CPUs.
+    12 vCPUs (Colab L4) -> 3, 32 threads (RTX 4090 grader) -> 4, <= 11 CPUs -> 2."""
+    cpus = cpu_count if cpu_count is not None else (os.cpu_count() or 1)
+    return max(MIN_AUTO_THREADS, min(MAX_AUTO_THREADS, cpus // 4))
+
+
+def decode_threads_arg(text):
+    """argparse type for --decode-threads: "auto" or an integer >= 0."""
+    if str(text).strip().lower() == "auto":
+        return "auto"
+    try:
+        n = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected 'auto' or an integer >= 0, got {text!r}")
+    if n < 0:
+        raise argparse.ArgumentTypeError("--decode-threads must be >= 0")
+    return n
 
 
 class Record(NamedTuple):
@@ -286,9 +310,10 @@ def parse_args(argv=None):
                     help=f"frames per second sent to the model, evenly spaced; 0 = every frame (default {DEFAULT_SAMPLE})")
     ap.add_argument("--precision", choices=["fp16", "fp32"], default=DEFAULT_PRECISION,
                     help=f"model precision on the GPU (default {DEFAULT_PRECISION})")
-    ap.add_argument("--decode-threads", type=int, default=DEFAULT_DECODE_THREADS, metavar="N",
-                    help="N > 0: decode/letterbox in N threads overlapped with inference, batches across videos; "
-                         f"0 = one video at a time (default {DEFAULT_DECODE_THREADS})")
+    ap.add_argument("--decode-threads", type=decode_threads_arg, default=DEFAULT_DECODE_THREADS, metavar="N",
+                    help="decode/letterbox threads overlapped with inference, batches across videos; 'auto' = "
+                         f"one per 4 CPUs, {MIN_AUTO_THREADS}..{MAX_AUTO_THREADS}; 0 = one video at a time "
+                         f"(default {DEFAULT_DECODE_THREADS})")
     ap.add_argument("--resume", action="store_true", help="continue a previous run (uses <output>.done)")
     ap.add_argument("--limit-videos", type=int, default=None, help="only the first N videos")
     ap.add_argument("--dump-frames", default=None, metavar="DIR", help="save per-frame npz per video")
@@ -376,9 +401,8 @@ def _main(args, stats):
     if args.sample < 0:
         print("--sample must be >= 0 (0 = every frame)", file=sys.stderr)
         return 2
-    if args.decode_threads < 0:
-        print("--decode-threads must be >= 0", file=sys.stderr)
-        return 2
+    if args.decode_threads == "auto":
+        args.decode_threads = 0 if args.dump_frames else auto_decode_threads()
     if args.dump_frames and args.decode_threads > 0:
         print("--dump-frames is only supported with --decode-threads 0", file=sys.stderr)
         return 2
