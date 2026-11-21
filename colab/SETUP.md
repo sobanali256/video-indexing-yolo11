@@ -61,7 +61,7 @@ The brute-force reference uses 3 parquet files spread over the dataset:
 - **tune** = `train-00000`: all tuning of sampling and other speed-ups happens on this file only.
 - **holdout** = `train-00024` + `train-00049`: only scored, never tuned on.
 
-Brute force is **not** run on all 50 files (projected 25+ h). Instead: a clean timing on the tune file, a model-free frame
+Brute force is **not** run on all 50 files (projected ≈ 34.7 h on the L4, see HARDWARE.md). Instead: a clean timing on the tune file, a model-free frame
 count of all 50 files, and an extrapolation (step 12). `--limit-videos` is not used.
 
 ## 6. Data: only the 3 reference files first
@@ -85,7 +85,7 @@ ln -sf $D/train-00049-*.parquet /content/subset/holdout/
 After a reset, redo steps 1-4, re-download the 3 reference files (the step 6 download command), recreate the symlinks and, if the 50-file download (step 8) had not finished, start it again; finished downloads are skipped.
 
 ## 7. Clean timing run on the whole tune file (no download running, nothing else on the GPU)
-The plain grader command (no dumps, no checkpoints) wrapped by `bench.py`; its output is the tune reference:
+The brute-force command (every frame, FP32, `predict()`) wrapped by `bench.py`; its output is the tune reference:
 ```
 %%bash
 cd /content/video-indexing-yolo11

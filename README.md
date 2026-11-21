@@ -28,17 +28,77 @@ Where the speed comes from (each step measured on the L4 against the reference):
 | Sampling | 3 evenly spaced frames per second go to the model | 1,214 | 11.7x |
 | Pipelining | decode threads overlap the GPU, batches across videos, direct inference | 1,932 | 18.6x |
 
+```mermaid
+---
+config:
+  xyChart:
+    showDataLabel: true
+  themeVariables:
+    xyChart:
+      plotColorPalette: "#2e9e4f"
+---
+xychart-beta
+    title "Video frames per second on an NVIDIA L4 (higher is better)"
+    x-axis ["Brute force", "+ FP16", "+ sampling", "+ pipelining"]
+    y-axis "frames per second" 0 --> 2100
+    bar [104, 155, 1214, 1932]
+```
+
 ## How it works
+```mermaid
+flowchart TB
+    subgraph IN["1 · Input"]
+        direction LR
+        P["Parquet files<br/>(one video per row)"] --> R["Video rows<br/>(already-done videos skipped on resume)"]
+    end
+
+    subgraph CPU["2 · Decode threads on the CPU (auto: 2 to 4 threads)"]
+        direction LR
+        D["Decode every<br/>frame (PyAV)"] --> T["Exact timestamps<br/>from the first frame"]
+        T --> G["Group frames<br/>by second"]
+        G --> S["Keep 3 evenly spaced<br/>frames per second<br/>(10.7% of all frames)"]
+        S --> O["Rotate if the video<br/>has a rotation tag"]
+        O --> L["Letterbox to 640<br/>(Ultralytics LetterBox)"]
+    end
+
+    Q[("Bounded queue")]
+
+    subgraph GPU["3 · GPU loop (main thread)"]
+        direction LR
+        B["Batches of 32 frames:<br/>same shape, mixed videos"] --> Y["YOLO11l in FP16<br/>conf 0.4"]
+        Y --> N["Class-aware NMS<br/>IoU 0.7"]
+    end
+
+    subgraph AGG["4 · Per video, once all its frames are done"]
+        direction LR
+        A["Per second: an object counts if it is<br/>seen in at least half the sampled frames;<br/>people = median count, rounded down"] --> E["One line for every second<br/>up to the last frame<br/>(empty seconds included)"]
+    end
+
+    W[["results.jsonl<br/>+ .done resume file"]]
+    X["Keep the seconds already done<br/>+ one error line"]
+
+    IN --> CPU
+    CPU --> Q --> GPU
+    GPU --> AGG
+    AGG --> W
+    CPU -. "decode error" .-> X
+    IN -. "unreadable row or file" .-> X
+    X -.-> W
+
+    classDef cpu fill:#e8f1fb,stroke:#3b7dd8,color:#0b2a4a
+    classDef gpu fill:#e9f7ec,stroke:#2e9e4f,color:#0d3318
+    classDef io fill:#f6f6f6,stroke:#888,color:#222
+    classDef err fill:#fdecec,stroke:#d64545,color:#4a0b0b
+    class D,T,G,S,O,L cpu
+    class B,Y,N gpu
+    class P,R,Q,W,A,E io
+    class X err
 ```
-parquet files -> video rows (--resume skips videos already done)
-  decode threads (auto, 2-4): decode EVERY frame (PyAV) -> exact timestamp -> group by second
-                       -> keep 3 evenly spaced frames per second (all if a second has <= 3)
-                       -> rotate if the video has a rotation tag -> Ultralytics LetterBox (640, minimal rectangle)
-  main thread (GPU):   batches of 32 frames of one letterboxed shape, mixed across videos
-                       -> YOLO11l FP16 (conf 0.4, class-aware NMS IoU 0.7, the predictor's own backend and arguments)
-  per second:          object present if detected in >= half the sampled frames; people = median count (rounded down)
-                       -> one line per second up to the one holding the last frame (empty seconds included)
-```
+In words: each decode thread takes the next video, decodes every frame (exact timestamps, so second boundaries and the
+last second are exact), keeps 3 evenly spaced frames per second (all of them if a second has 3 or fewer), rotates and
+letterboxes them, and hands them over through a bounded queue. The main thread batches frames of the same letterboxed
+shape across videos and runs YOLO11l on the GPU. When all frames of a video are back, its per-second lines are written.
+
 - Every frame is still decoded, so second boundaries, frame counts and the last second are exact; only the frames sent
   to the model are sampled (`vidx/sampling.py`, shared with the offline simulator).
 - The direct inference path gives identical detections to Ultralytics `predict()` (checked on 1,000 frames, FP32 and FP16).
@@ -89,8 +149,8 @@ before the error are kept and one error line is appended. One bad video never st
 
 Brute-force reference: `python run.py --input DIR --output ref.jsonl --sample 0 --precision fp32 --decode-threads 0`.
 
-Exit codes: `0` done; `2` bad arguments, missing weights or a resume/checkpoint conflict; `3` three inference batches
-failed in a row (nothing is lost: restart and re-run with `--resume`). If the fast inference path cannot start, the run
+Exit codes: `0` done; `1` unexpected error; `2` bad arguments, missing weights or a resume/checkpoint conflict; `3` three
+inference batches failed in a row (nothing is lost: restart and re-run with `--resume`). If the fast inference path cannot start, the run
 logs a warning and falls back to `--decode-threads 0`.
 
 ### Durable checkpoints (long runs on a machine whose disk can be wiped, e.g. Colab)
@@ -115,7 +175,9 @@ checkpoint of that name exists (exit 2). `progress.json` in the checkpoint holds
 | `python tools/count_frames.py --input DIR --out frame_counts.csv` | count frames of all videos without the model (demux only) |
 | `python tools/check_schema.py results.jsonl` | output format check |
 | `python tools/batch_agreement.py --input DIR --direct --precision fp16` | direct inference path vs `predict()` |
-| `python tools/decoder_agreement.py`, `tools/profile_decode.py`, `tools/find_rotated.py` | decoder, decode-speed and rotation checks |
+| `python tools/decoder_agreement.py`, `tools/profile_decode.py`, `tools/find_rotated.py` | decoder, decode-speed and rotation-tag checks |
+| `python tools/rotation_check.py --input DIR` | our rotation vs ffmpeg's on 90/180/270 copies of a real video (needs the ffmpeg CLI) |
+| `python tools/make_damaged.py make/check ...` | damaged-input test set (truncated / random / null / empty mp4, corrupt parquet) and its checker |
 
 References: every-frame brute force on 3 parquet files spread over the dataset: **tune** = `train-00000` (all tuning),
 **holdout** = `train-00024` + `train-00049` (scored only). All measured runs are in `worklog/bench_log.csv`; the full
