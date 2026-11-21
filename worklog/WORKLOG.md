@@ -25,6 +25,14 @@ Deadline: **Sun 22 Nov 2026, 23:55 PKT**
 - [ ] Final secret scan + push before the deadline
 
 ## Completed
+- 2026-11-21: **Extra holdout (train-00012 + train-00037), never used to choose anything: PASS.** Done in a local-only notebook (`colab/extra_holdout.ipynb`, not committed); L4, commit bb7c8f0.
+  - New brute-force reference (every frame, FP32, `--decode-threads 0`): 66 videos, 570,485 frames, 19,986 s of video; 5,536 s = **103.1 frames/s** (matches the 104 fps baseline). Saved as `reference/ref_extra.jsonl` on Drive.
+  - **Submitted `results.jsonl.gz` (tag results-v1)** vs that reference:
+    - train-00012: F1 0.9875, exact 0.9410, within ±1 0.9960;
+    - train-00037: F1 0.9835, exact 0.9718, within ±1 0.9986;
+    - both: F1 **0.9858**, exact **0.9539**, within ±1 **0.9971** (19,986 / 19,986 seconds, 0 missing, 0 extra, 0 errors).
+    - All above our own bar (0.985 / 0.93 / 0.985) as well as the grader's. Worst video: train-00012:20, F1 0.889.
+  - **Fresh run, current defaults (main, auto threads):** 570,485 frames in 294.4 s = **1,938 frames/s**, which is **18.8×** the brute force on the same files. Its output is line-for-line identical to the submitted results for these files (19,986 lines). Logged in the Drive `bench_log.csv` (row "extra holdout 00012+00037 defaults NVIDIA_L4").
 - 2026-11-21: **Final consistency review (fresh subagent):** nothing to fix in code, numbers, commands or results. Confirmed:
   - results.jsonl.gz: schema OK, 1,650 videos, 50 files.
   - Every number agrees across README / HARDWARE / WORKLOG / bench_log; every documented flag and command matches argparse.

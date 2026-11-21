@@ -1,0 +1,507 @@
+import contextlib
+import io
+import os
+import sys
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import score  # noqa: E402
+
+
+def sec(video, s, objects=(), people=0):
+    return {"video": video, "second": s, "objects": list(objects), "people": people}
+
+
+def metrics(ref, cand):
+    return score.compute(score.parse_lines(ref), score.parse_lines(cand))
+
+
+class ScoreTest(unittest.TestCase):
+    def test_identical(self):
+        ref = [sec("v:0", 0, ["person"], 2), sec("v:0", 1, ["car", "dog"], 0), sec("v:1", 0, [], 0)]
+        m = metrics(ref, list(ref))
+        self.assertEqual(m["micro_f1"], 1.0)
+        self.assertEqual(m["macro_f1"], 1.0)
+        self.assertEqual(m["people_exact"], 1.0)
+        self.assertEqual(m["people_within1"], 1.0)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(score.report(m))
+
+    def test_both_empty_is_perfect(self):
+        ref = [sec("v:0", 0), sec("v:0", 1)]
+        m = metrics(ref, list(ref))
+        self.assertEqual(m["micro_f1"], 1.0)
+        self.assertEqual(m["video_f1"]["v:0"], 1.0)
+
+    def test_missing_seconds_count_as_empty(self):
+        ref = [sec("v:0", 0, ["car"], 1), sec("v:0", 1, [], 0)]
+        cand = [sec("v:0", 1, [], 0)]
+        m = metrics(ref, cand)
+        self.assertEqual(m["missing_seconds"], 1)
+        self.assertEqual(m["micro_f1"], 0.0)  # tp 0, fn 1
+        self.assertEqual(m["people_exact"], 0.5)  # 1 vs predicted 0 is wrong; empty second matches
+        self.assertEqual(m["people_within1"], 1.0)
+
+    def test_extra_seconds_are_false_positives(self):
+        ref = [sec("v:0", 0, ["car"], 0)]
+        cand = [sec("v:0", 0, ["car"], 0), sec("v:0", 1, ["dog", "car"], 3)]
+        m = metrics(ref, cand)
+        self.assertEqual(m["extra_seconds"], 1)
+        self.assertAlmostEqual(m["micro_f1"], 2 * 1 / (2 * 1 + 2 + 0))
+        self.assertEqual(m["people_exact"], 1.0)  # people only judged on reference seconds
+
+    def test_people_tolerance(self):
+        ref = [sec("v:0", i, [], 2) for i in range(4)]
+        cand = [sec("v:0", 0, [], 2), sec("v:0", 1, [], 3), sec("v:0", 2, [], 1), sec("v:0", 3, [], 5)]
+        m = metrics(ref, cand)
+        self.assertEqual(m["people_exact"], 0.25)
+        self.assertEqual(m["people_within1"], 0.75)
+
+    def test_thresholds_fail(self):
+        ref = [sec("v:0", i, ["car"], 0) for i in range(10)]
+        cand = [sec("v:0", i, [] if i < 2 else ["car"], 0) for i in range(10)]
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(score.report(metrics(ref, cand)))
+
+    def test_error_lines_counted_separately(self):
+        ref = [sec("v:0", 0, ["car"], 0), {"video": "v:1", "error": "bad"}]
+        cand = [sec("v:0", 0, ["car"], 0), {"video": "v:2", "error": "bad"}]
+        m = metrics(ref, cand)
+        self.assertEqual((m["ref_errors"], m["cand_errors"], m["error_mismatch"]), (1, 1, 2))
+        self.assertEqual(m["micro_f1"], 1.0)
+
+    def test_empty_files(self):
+        m = metrics([], [])
+        self.assertEqual((m["micro_f1"], m["people_exact"], m["people_within1"]), (1.0, 1.0, 1.0))
+
+
+if __name__ == "__main__":
+    unittest.main()
+"""Check a results file against the output format. Exit 1 if anything is wrong.
+
+    python tools/check_schema.py results.jsonl
+"""
+import json
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from vidx.aggregate import OBJECTS  # noqa: E402
+
+
+def check(path):
+    problems = []
+    seconds = defaultdict(list)
+    errors = defaultdict(int)
+    with open(path, encoding="utf-8") as f:
+        for n, raw in enumerate(f, 1):
+            if not raw.strip():
+                continue
+            try:
+                d = json.loads(raw)
+            except ValueError:
+                problems.append(f"line {n}: not valid JSON")
+                continue
+            if not isinstance(d, dict):
+                problems.append(f"line {n}: not a JSON object")
+                continue
+            video = d.get("video")
+            if not isinstance(video, str) or ":" not in video:
+                problems.append(f"line {n}: bad video id {video!r}")
+                continue
+            if "error" in d:
+                if set(d) != {"video", "error"} or not isinstance(d["error"], str):
+                    problems.append(f"line {n}: malformed error line")
+                errors[video] += 1
+                continue
+            if set(d) != {"video", "second", "objects", "people"}:
+                problems.append(f"line {n}: wrong keys {sorted(d)}")
+                continue
+            sec, objs, ppl = d["second"], d["objects"], d["people"]
+            if not isinstance(sec, int) or isinstance(sec, bool) or sec < 0:
+                problems.append(f"line {n}: bad second {sec!r}")
+            if not isinstance(ppl, int) or isinstance(ppl, bool) or ppl < 0:
+                problems.append(f"line {n}: bad people {ppl!r}")
+            if not isinstance(objs, list) or any(o not in OBJECTS for o in objs):
+                problems.append(f"line {n}: bad objects {objs!r}")
+            elif objs != [o for o in OBJECTS if o in objs]:
+                problems.append(f"line {n}: objects not unique/in canonical order {objs!r}")
+            seconds[video].append(sec)
+    for video, secs in seconds.items():
+        if sorted(secs) != list(range(len(secs))):
+            problems.append(f"{video}: seconds not contiguous from 0 (got {len(secs)} lines, max {max(secs)})")
+    for video, n in errors.items():
+        if n > 1:
+            problems.append(f"{video}: {n} error lines")
+    print(f"{len(seconds)} videos with seconds, {len(errors)} with error lines")
+    return problems
+
+
+def main():
+    if len(sys.argv) != 2:
+        raise SystemExit(__doc__)
+    problems = check(sys.argv[1])
+    for p in problems[:50]:
+        print("PROBLEM:", p)
+    if len(problems) > 50:
+        print(f"... and {len(problems) - 50} more")
+    print("schema OK" if not problems else f"{len(problems)} problems")
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+# Colab L4 setup (VS Code Colab extension)
+
+The ready-made notebook `colab/baseline.ipynb` contains every step below as cells.
+
+How the extension works: you open a notebook in VS Code and pick a Colab server as its kernel; cells run on
+Google's VM, not on your machine. Local files are **not** synced, so the code reaches Colab via `git clone`.
+Shell commands go in cells as `!cmd` or `%%bash`. Every `!` line is a fresh shell, so `source activate` does
+not persist; always call the venv tools by full path (`/content/venv/bin/python`, `/content/venv/bin/hf`).
+Keep VS Code open and the machine awake during long runs. A runtime reset wipes `/content`.
+
+Never paste the HF token into a file or a saved cell: use a Colab Secret named `HF_TOKEN`, or the `getpass` prompt.
+
+## 1. Connect and check the machine
+VS Code: install the "Google Colab" extension, open `colab/baseline.ipynb`, **Select Kernel → Colab → New Colab
+Server → GPU → L4**, sign in with the Colab Pro account.
+```
+!nvidia-smi; df -h /content; free -h; nproc; lscpu | grep "Model name"; python3 --version
+```
+Note GPU, CPU model + cores, RAM, disk for HARDWARE.md. Need ~25 GB data plus headroom.
+
+## 2. Python 3.11 venv, code, model
+The grader uses Python 3.11; Colab's default differs, so use a uv-managed 3.11 venv.
+```
+%%bash
+set -e
+cd /content
+pip install -q uv
+[ -d /content/venv ] || uv venv --python 3.11 /content/venv
+[ -d video-indexing-yolo11 ] || git clone https://github.com/sobanali256/video-indexing-yolo11.git
+cd video-indexing-yolo11 && git pull
+apt-get install -y -q libgl1 libglib2.0-0
+uv pip install --python /content/venv/bin/python -r requirements.txt
+/content/venv/bin/python -c "import torch,av,ultralytics;print(torch.__version__,torch.cuda.is_available(),av.__version__,ultralytics.__version__)"
+/content/venv/bin/python prepare.py
+```
+If a pin fails to resolve, fix it in `requirements.txt` and log it in `worklog/WORKLOG.md`.
+
+## 3. Hugging Face login
+```python
+from huggingface_hub import login
+try:
+    from google.colab import userdata
+    login(userdata.get("HF_TOKEN"))
+except Exception:
+    import getpass
+    login(getpass.getpass("HF token: "))
+```
+The token is cached on the VM (`~/.cache/huggingface`), outside the repo; the venv's `hf` uses it too.
+
+## 4. Data
+First two files (foreground), then all 50 in the background:
+```
+!/content/venv/bin/hf download HuggingFaceFV/finevideo --repo-type dataset --include "data/train-0000[0-1]*" --local-dir /content/finevideo
+!df -h /content
+!nohup /content/venv/bin/hf download HuggingFaceFV/finevideo --repo-type dataset --include "data/train-000[0-4]*" --local-dir /content/finevideo > /content/download.log 2>&1 &
+```
+Files land in `/content/finevideo/data/`. After a reset, re-run these; finished files are skipped.
+
+## 5. Durable checkpoint storage
+Try Google Drive first:
+```python
+from google.colab import drive
+drive.mount("/content/drive")
+```
+If the mount fails through the extension: create a **private** dataset repo on huggingface.co (token needs write
+access) and replace `--checkpoint-dir …` with `--checkpoint-hf-repo YOURNAME/vidx-ckpt` below; `--dump-frames`
+can then stay on local disk (`reference/frames`) and the npz files are uploaded to `<run-name>/frames/`.
+
+## 6. Baseline on the subset (reference + per-frame dumps)
+Runs in the background so the notebook stays usable:
+```
+!cd /content/video-indexing-yolo11 && nohup /content/venv/bin/python run.py --input /content/finevideo/data --output reference/ref_subset.jsonl --limit-videos 64 --dump-frames /content/drive/MyDrive/vidx/frames --checkpoint-dir /content/drive/MyDrive/vidx --run-name ref_subset > /content/baseline.log 2>&1 &
+!tail -5 /content/baseline.log
+```
+`--limit-videos 64` ≈ the first two files. After a reset: redo steps 1–5, then the same command **with `--resume`**.
+A fresh run without `--resume` refuses to start when a checkpoint with that run name exists.
+Record the final timing line (decode / infer / aggregate / total, frames/s) in the worklog.
+Elapsed time across sessions: `progress.json` in the newest checkpoint generation (`compute_s`, `wall_first_start`,
+`wall_last_end`, `sessions`).
+
+## 7. Checks
+```
+%%bash
+cd /content/video-indexing-yolo11
+PY=/content/venv/bin/python
+$PY tools/check_schema.py reference/ref_subset.jsonl
+$PY score.py reference/ref_subset.jsonl reference/ref_subset.jsonl     # expect 1.0 / 100% / 100%
+$PY tools/find_rotated.py --input /content/finevideo/data --max-files 2
+$PY tools/decoder_agreement.py --input /content/finevideo/data --n 20
+$PY tools/batch_agreement.py --input /content/finevideo/data --frames 1000
+```
+Rotation: for a rotated clip found above, compare against `ffmpeg` autorotate (one frame with and without `-noautorotate`).
+Damaged input: truncate a video's bytes and corrupt a copy of a parquet file, run on that folder; each must give error lines and the run must continue.
+Offline: run once with networking disabled; nothing may download.
+
+## 8. Scoring a candidate later
+```
+!cd /content/video-indexing-yolo11 && /content/venv/bin/python score.py reference/ref_subset.jsonl candidate.jsonl
+```
+# WORKLOG (committed to the repo: never put secrets or tokens here)
+
+Deadline: **Sun 22 Nov 2026, 23:55 PKT**
+
+## Next up
+1. User: review the code written on 2026-11-19, then `/code-review` it and fix findings.
+2. User: push the setup commit `c63d7cd` (it has not reached GitHub; push from a terminal where the credential prompt works).
+3. Colab L4 (see `colab/SETUP.md`): py3.11 venv, `pip install -r requirements.txt` (pins are provisional), `python prepare.py`, HF login via Colab Secret, download 2 parquet files, then the full 50 in the background.
+4. Colab: baseline on the subset with `--dump-frames` -> `reference/ref_subset.jsonl`; record fps and stage timings; run the checks listed under Pending.
+5. Then speed-up planning (sampling, decode speed, batching, FP16, pipelining, maybe TensorRT), each validated with `score.py` against the reference.
+
+## Pending
+- [ ] HF access + token (Colab Secret)
+- [ ] Colab: confirm Drive mount via VS Code extension, else create private HF dataset repo and use `--checkpoint-hf-repo`; then reset the runtime mid-subset-run and resume from the checkpoint
+- [ ] Colab L4 environment verified (GPU, disk, Python/CUDA versions)
+- [ ] Download 50 parquet files to Colab
+- [ ] Verify `requirements.txt` pins in a fresh Python 3.11 venv (PROVISIONAL: torch 2.6.0/cu126, torchvision 0.21.0, ultralytics 8.3.100, av 14.2.0, pyarrow 19.0.1, numpy 1.26.4, opencv-python 4.10.0.84)
+- [ ] Run `prepare.py` on Colab (check download path logic works; weights end up at repo root `yolo11l.pt`)
+- [ ] Baseline run on the subset with `--dump-frames`; record stage timings and fps; extrapolate full-run time (state honestly in the write-up that brute force ran on a subset only)
+- [ ] `score.py ref ref` -> F1 1.0 / 100% / 100%
+- [ ] `tools/check_schema.py` on the subset output
+- [ ] Rotation: `tools/find_rotated.py`, then compare a rotated clip against `ffmpeg` autorotate; confirm the sign (display-matrix angles are counter-clockwise) and that PyAV >= 14 exposes `frame.rotation` (else the side-data / legacy-tag fallbacks are used, and they are untested)
+- [ ] Decoder agreement (`tools/decoder_agreement.py`, ~20 videos); below ~0.99 -> ask the user which decoder is the reference
+- [ ] Batch vs single-frame agreement >= 0.999 over 1k frames, classes filter vs none identical (`tools/batch_agreement.py`)
+- [ ] Damaged input: truncated mp4 bytes and corrupted parquet each give error lines and the run continues
+- [ ] Offline run (network disabled): nothing downloads, no crash
+- [ ] Test `source.py` (never run locally: pip downloads were too slow; helper script idea: small synthetic parquet incl. a corrupt file and a null mp4) and then against real FineVideo parquet (row-group layout, `as_buffer()` on the mp4 column)
+- [ ] Speed optimisations (iterative, each validated)
+- [ ] Resumable full run on all 50 files -> results.jsonl.gz
+- [ ] HARDWARE.md (Colab L4 specs + full-run time)
+- [ ] README.md performance section
+- [ ] WRITEUP.md: **user writes this, no AI**
+- [ ] ai_chats/: copy Claude Code .jsonl, redact tokens, add web links
+- [ ] Final secret scan + push before deadline
+
+## Completed
+- 2026-11-19: Durable checkpoints for long Colab runs (new `vidx/checkpoint.py`, imported only when `--checkpoint-dir` / `--checkpoint-hf-repo` is given; plain `run.py --input --output` unchanged). Generation folders `gen-NNNN/` (gz output, done.txt, progress.json, manifest.json last with sizes + sha256 + run fingerprint), newest 2 kept, snapshot every `--checkpoint-minutes` (10) at a video boundary plus a final one in `finally` (SIGTERM mapped to exit); every snapshot failure only warns. `--resume` restores the newest valid generation if ahead of the local files; a fresh run over an existing checkpoint exits 2. Sidecar is now `video_id<TAB>line_count` (plain ids still read) and `_recover` redoes a video whose lines are incomplete. `--dump-frames` writes `<name>.tmp.npz` then `os.replace`. `huggingface_hub==0.29.3` pinned (provisional). Tests: `tests/test_checkpoint.py`, extended `test_output.py` / `test_run.py` (smoke test uses fake `iter_rows` + decode because `.venv` has no pyarrow). Not yet run on Colab; `/code-review` pending.
+- 2026-11-19: Housekeeping: worklog moved to `worklog/WORKLOG.md`, removed from `.gitignore`, CLAUDE.md paths and wording updated (worklog is now committed).
+- 2026-11-19: Wrote the baseline pipeline per plan: `run.py`, `prepare.py`, `score.py`, `vidx/{source,decode,model,aggregate,output}.py`, `tools/{find_rotated,decoder_agreement,batch_agreement,check_schema}.py`, `tests/` (CPU, stdlib unittest), `requirements.txt` (provisional pins), `colab/SETUP.md`, README install/prepare/run.
+- 2026-11-19: Local checks: `python -m unittest discover -s tests -v` passes (42 tests), every .py compiles.
+- 2026-11-19: Added TensorRT-deferred backend design to CLAUDE.md; first commit made (brief PDF stays out of repo).
+- 2026-11-19: Read brief. Git repo initialised in D:\video-indexing-yolo11, tracking origin/main (remote had LICENSE only). Created .gitignore, CLAUDE.md, README.md stub, ai_chats/links.txt, this WORKLOG.
+
+## Open issues
+- #2 (2026-11-19) Dev machine is Python 3.14; grader is 3.11. Pins are provisional until verified in a 3.11 venv on Colab.
+- #5 (2026-11-19) `ultralytics` depends on `opencv-python` (non-headless), which may be installed next to `opencv-python-headless` and needs `libgl1`. README/SETUP list `apt-get install libgl1 libglib2.0-0`. Revisit if the grader VM lacks apt access.
+- #6 (2026-11-19) Assumptions made while coding (review these):
+  - Parquet that cannot be opened -> one error line `<file>:0`. A file that opens but has an unreadable row group -> one error line per remaining row of that group (row counts come from the footer).
+  - Error text format: `could not decode video: <ExceptionType: message>` (truncated to 200 chars); zero decoded frames without an exception -> `no frames decoded`.
+  - `--limit-videos N` counts the first N videos in sorted file/row order, including ones skipped by `--resume`.
+  - The inference batch size is the whole `predict()` list; relies on Ultralytics treating a list of ndarrays as one batch.
+  - `prepare.py` downloads with `ultralytics.utils.downloads.attempt_download_asset(<abs path>)`, falling back to `YOLO("yolo11l.pt")` in the repo dir. Untested.
+  - Offline settings: `YOLO_OFFLINE=1`, `settings.update(sync=False)`, `YOLO_CONFIG_DIR` in the temp dir (set with `setdefault`). Untested; confirm with the offline check.
+  - `io.BytesIO(memoryview(buffer))` copies the mp4 bytes once per video (cheap relative to decode); `as_buffer()` itself does not copy.
+  - Stream-level rotation side data via `stream.side_data["DISPLAYMATRIX"]` is a guess about the PyAV API; it is wrapped in try/except and only a fallback after `frame.rotation`.
+  - `--resume` fsync is not done (flush only); a VM crash could lose the last video, which is simply redone because the sidecar is written after the output.
+- #4 (2026-11-19) RESOLVED: worklog is now committed in `worklog/`.
+- #7 (2026-11-19) Checkpoint assumptions (review, untested on Colab / the real HF Hub):
+  - `huggingface_hub==0.29.3` is believed to have `HfApi.upload_folder`, `delete_folder`, `list_repo_files`, `hf_hub_download(local_dir=)`; only a fake API object was tested. The repo must exist already (not auto-created).
+  - `--checkpoint-dir` stores under `DIR/<run-name>/gen-NNNN` (the plan said straight into DIR) so `--run-name` and the fresh-run guard work for folders too.
+  - HF `--dump-frames` files go to `<run-name>/frames/` in the same commit as the generation (never pruned), so old generations can be deleted without losing frames. Dump files are not restored automatically.
+  - Restore compares done-video counts: local wins ties; local counts only if output and sidecar both exist. A restore error (network, corrupt store) exits 2 rather than silently starting over.
+  - A checkpoint with a different fingerprint (input path, `--limit-videos`, output name, run name; superseded input-size rule: see Code review #2) is refused (exit 2) even if older than local files.
+  - The final snapshot always makes a new generation, even if nothing changed. Time lost after a crashed session's last snapshot is not in `compute_s`.
+  - A half-written dump is only protected from partial reads, not cleaned up at start; `*.tmp.npz` files are ignored by the HF uploader.
+  - SIGTERM handler is `sys.exit(143)`, installed only with a checkpoint flag. Windows `.venv` runs Python 3.14, so the tests have not run on 3.11.
+
+## Deferred
+- #3 (2026-11-19) **Deferred, design noted.** TensorRT: L4 dev vs RTX 4090 grader, engine must be built in grader prep step. Rules recorded in CLAUDE.md "Inference backend". Baseline first with PyTorch .pt; model behind load_model()/infer(batch).
+
+## Closed issues
+- 2026-11-19 **Code review #1** (10 findings, all closed; 55 tests pass):
+  - R1 Inference failures were handled like decode failures. Fix: `run_inference` splits a batch in halves on CUDA OOM; other model errors raise `InferenceError`, the video is not written or marked done, and 3 in a row abort the run (exit 3, retry with `--resume`).
+  - R2 `YOLO_OFFLINE` was set to "1". Fix: now "True" (Ultralytics compares `value.lower() == "true"`).
+  - R3 A `--dump-frames` failure discarded the video's lines. Fix: the dump has its own try/except and only logs a warning.
+  - R4 `opencv-python-headless` clashed with the `opencv-python` that ultralytics pulls in. Fix: pinned `opencv-python==4.10.0.84` (numpy<2 compatible); SETUP.md wording updated. Still PROVISIONAL until verified (also supersedes #5's duplicate-wheel concern).
+  - R5 Leading frames without pts then a pts reset time to 0. Fix: `first_pts` is anchored so the first pts frame continues the estimated timeline.
+  - R6 No-rate fallback used absolute index/30. Fix: `last_t + step` (1/rate, else median of previous positive gaps, else 1/30; first frame 0).
+  - R7 `--resume` with an output but no `.done` sidecar silently wiped the output. Fix: `ResumeError` with a clear message (main exits 2).
+  - R8 All frame details were kept in memory. Fix: `process_frames(..., keep_details=)`; full records only with `--dump-frames`.
+  - R9 Two GPU transfers per result in `infer`. Fix: one `boxes.data.cpu()`, conf = column 4, cls = column 5.
+  - R10 `tools/batch_agreement.py` re-implemented batching. Fix: it calls `run.process_frames` with batch 1 vs `--batch`, plus a `classes=None` wrapper.
+- 2026-11-19 **Code review #2 (checkpoints)** (10 findings closed; 95 tests pass):
+  - C1 Fingerprint covered every parquet, so a changed download set blocked resume. Fix: fingerprint = resolved input path + `--limit-videos` + output name + run name; the manifest records name+size of each parquet that had a video processed, and resume refuses only if one of those is missing or changed size (new files are fine).
+  - C2 One `InferenceError` video was silently dropped with exit 0. Fix: failed ids wait in a pending list; the next successful video first writes them as `inference failed: ...` error lines (marked done); 3 in a row abort with exit 3 without writing them (`--resume` retries); leftovers at the normal end are written as error lines.
+  - C3 A store listing failure counted as "no checkpoint". Fix: `Checkpointer.startup()` lists every store once and raises `CheckpointError` (exit 2) if any fails, for fresh and resume runs alike.
+  - C4 `restore()` died on one bad generation. Fix: fetch/validate errors per generation are logged and the next older generation / other store is tried.
+  - C5 A missing Drive mount would be recreated as a local folder. Fix: `DirStore` requires the checkpoint dir's parent to exist ("checkpoint dir parent missing — is Google Drive mounted?"), at listing and at publish; only the dir and `<run-name>` are ever created.
+  - C6 One generation number for all stores, and a prune error counted as a failed publish. Fix: number computed per store inside its own try/except; prune failure only warns, the publish still counts and dump frames are marked sent.
+  - C7 A sidecar entry with no output lines (legacy, or count 0) counted as done. Fix: done needs >= 1 complete line (exactly the recorded count if known); `write_video` refuses an empty list, so a count of 0 is never written.
+  - C8 `huggingface_hub==0.29.3` has no `hf` CLI. Fix: pinned `huggingface_hub==0.34.4` (still PROVISIONAL, unverified on Colab; `HfApi` methods used by `HFStore` are only tested against a fake).
+  - C9 `prune()` kept the newest 2 numbers even if invalid. Fix: `prune_store` keeps the newest 2 valid generations (manifest + sizes; HF: manifest present in the listing) and deletes invalid/partial and older ones.
+  - C10 (**partial**) Re-listing stores every snapshot and re-reading files for sha256. Fix: generation numbers are listed once at startup and kept in memory per store; size and sha256 are computed while writing. Deliberately NOT done: background upload thread.
+- #1 (2026-11-19) The worklog used to be private; it is now committed in `worklog/`, so chat logs and the repo agree.
+- #4 (2026-11-19) Decision made: commit the worklog in `worklog/`.
+
+## Session log
+- 2026-11-19: Session "Alethia": repo setup.
+- 2026-11-19: Execution session (Sonnet): housekeeping + local code per the approved plan (steps 1-2). Colab steps not started.
+{'accelerator': 'GPU', 'kernelspec': {'display_name': 'Python 3 (ipykernel)', 'language': 'python', 'name': 'python3'}} 4 5
+----- markdown
+# Baseline on Colab L4
+Kernel: **Colab → New Colab Server → GPU → L4**. See `colab/SETUP.md`. Never paste the HF token into a cell.
+----- markdown
+## 1. Machine (note for HARDWARE.md)
+----- code
+!nvidia-smi; df -h /content; free -h; nproc; lscpu | grep "Model name"; python3 --version
+----- markdown
+## 2. Python 3.11 venv, code, model
+----- code
+%%bash
+set -e
+cd /content
+pip install -q uv
+[ -d /content/venv ] || uv venv --python 3.11 /content/venv
+[ -d video-indexing-yolo11 ] || git clone https://github.com/sobanali256/video-indexing-yolo11.git
+cd video-indexing-yolo11 && git pull
+apt-get install -y -q libgl1 libglib2.0-0
+uv pip install --python /content/venv/bin/python -r requirements.txt
+/content/venv/bin/python -c "import torch,av,ultralytics;print(torch.__version__,torch.cuda.is_available(),av.__version__,ultralytics.__version__)"
+/content/venv/bin/python prepare.py
+----- markdown
+## 3. Hugging Face login (Colab Secret `HF_TOKEN`, else prompt)
+----- code
+from huggingface_hub import login
+try:
+    from google.colab import userdata
+    login(userdata.get("HF_TOKEN"))
+except Exception:
+    import getpass
+    login(getpass.getpass("HF token: "))
+----- markdown
+## 4. Data: 2 files now, all 50 in the background
+----- code
+!/content/venv/bin/hf download HuggingFaceFV/finevideo --repo-type dataset --include "data/train-0000[0-1]*" --local-dir /content/finevideo
+!df -h /content
+----- code
+!nohup /content/venv/bin/hf download HuggingFaceFV/finevideo --repo-type dataset --include "data/train-000[0-4]*" --local-dir /content/finevideo > /content/download.log 2>&1 &
+----- code
+!tail -3 /content/download.log; ls /content/finevideo/data | wc -l
+----- markdown
+## 5. Checkpoint storage: try Drive (if it fails use `--checkpoint-hf-repo` in step 6)
+----- code
+from google.colab import drive
+drive.mount("/content/drive")
+----- markdown
+## 6. Baseline on the subset (background). After a reset: rerun 1-5, then this cell with `--resume` added.
+----- code
+!cd /content/video-indexing-yolo11 && nohup /content/venv/bin/python run.py --input /content/finevideo/data --output reference/ref_subset.jsonl --limit-videos 64 --dump-frames /content/drive/MyDrive/vidx/frames --checkpoint-dir /content/drive/MyDrive/vidx --run-name ref_subset > /content/baseline.log 2>&1 &
+----- code
+!tail -5 /content/baseline.log; nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv
+----- markdown
+## 7. Checks (after the run finishes)
+----- code
+%%bash
+cd /content/video-indexing-yolo11
+PY=/content/venv/bin/python
+$PY tools/check_schema.py reference/ref_subset.jsonl
+$PY score.py reference/ref_subset.jsonl reference/ref_subset.jsonl
+$PY tools/find_rotated.py --input /content/finevideo/data --max-files 2
+$PY tools/decoder_agreement.py --input /content/finevideo/data --n 20
+$PY tools/batch_agreement.py --input /content/finevideo/data --frames 1000
+import json
+import os
+import sys
+import unittest
+from pathlib import Path
+from fractions import Fraction as F
+from types import SimpleNamespace
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import run  # noqa: E402
+from vidx.decode import Frame  # noqa: E402
+from vidx.model import summarize  # noqa: E402
+
+
+def frame(t, shape=(4, 6, 3), person=0):
+    return Frame(SimpleNamespace(shape=shape, person=person), t, None, 0)
+
+
+class FakeInfer:
+    """Counts persons from the fake image; remembers each batch it was given."""
+
+    def __init__(self, fail_on_call=None, oom_above=None):
+        self.batches = []
+        self.ok_batches = []
+        self.fail_on_call = fail_on_call
+        self.oom_above = oom_above  # raise a fake CUDA OOM for batches larger than this
+
+    def __call__(self, images):
+        self.batches.append([im.shape for im in images])
+        if self.fail_on_call == len(self.batches):
+            raise RuntimeError("some other model failure")
+        if self.oom_above is not None and len(images) > self.oom_above:
+            raise RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
+        self.ok_batches.append(list(images))
+        return [([im.person, 0, 0, 0, 0], [0.9, 0, 0, 0, 0]) for im in images]
+
+
+class ProcessFramesTest(unittest.TestCase):
+    def test_batching(self):
+        fi = FakeInfer()
+        frames = [frame(F(i, 10)) for i in range(7)]
+        records, error = run.process_frames(iter(frames), fi, 3, run.Timers())
+        self.assertIsNone(error)
+        self.assertEqual(len(records), 7)
+        self.assertEqual([len(b) for b in fi.batches], [3, 3, 1])
+
+    def test_flush_on_shape_change(self):
+        fi = FakeInfer()
+        shapes = [(4, 6, 3)] * 2 + [(6, 4, 3)] * 2 + [(4, 6, 3)]
+        frames = [frame(F(i, 10), shape=s) for i, s in enumerate(shapes)]
+        records, _ = run.process_frames(iter(frames), fi, 32, run.Timers(), keep_details=True)
+        self.assertEqual([len(b) for b in fi.batches], [2, 2, 1])
+        self.assertEqual([r.shape for r in records], shapes)
+
+    def test_decode_failure_keeps_partial_second(self):
+        def gen():
+            yield frame(F(0), person=1)
+            yield frame(F(1), person=1)
+            yield frame(F(21, 10), person=2)  # part of second 2
+72:    def test_failure_before_any_frame(self):
+82:    def test_zero_frames_without_exception_is_error(self):
+87:    def test_inference_failure_raises_inference_error(self):
+92:    def test_oom_batch_is_split_and_retried(self):
+101:    def test_oom_at_batch_size_one_is_inference_error(self):
+105:    def test_keep_details(self):
+113:    def test_clean_video_has_no_error_line(self):
+132:class ProcessVideoTest(unittest.TestCase):
+143:    def test_ok(self):
+147:    def test_inference_error_propagates_not_a_line(self):
+151:    def test_decode_error_keeps_lines_and_one_error(self):
+156:    def test_dump_failure_keeps_lines(self):
+170:class MainAbortTest(unittest.TestCase):
+171:    def test_three_inference_failures_in_a_row_abort_without_writing(self):
+207:class FakeRun:
+257:class PendingInferenceFailureTest(unittest.TestCase):
+262:    def test_single_failure_followed_by_success_is_written_as_error_line_and_done(self):
+272:    def test_failure_at_the_end_of_the_run_is_written_as_error_line(self):
+278:    def test_success_resets_the_counter(self):
+283:    def test_abort_leaves_pending_unwritten_so_resume_retries_them(self):
+294:class CheckpointMainTest(unittest.TestCase):
+295:    def test_plain_run_does_not_import_checkpoint_module_or_write_extra_files(self):
+302:    def test_fresh_run_against_existing_checkpoint_exits_2(self):
+311:    def test_resume_from_checkpoint_after_losing_local_files_matches_uninterrupted_run(self):
+328:    def test_resume_survives_new_parquet_files_but_refuses_a_changed_processed_one(self):
+339:    def test_checkpoint_dir_with_missing_parent_exits_2_and_creates_nothing(self):
+346:    def test_snapshot_oserror_keeps_run_and_exit_code(self):
+366:    def test_npz_temp_name_ends_with_npz_and_differs_from_final(self):
+382:class SummarizeTest(unittest.TestCase):
+383:    def test_summarize(self):

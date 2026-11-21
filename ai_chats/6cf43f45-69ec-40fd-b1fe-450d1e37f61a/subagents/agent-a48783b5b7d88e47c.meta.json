@@ -1,0 +1,1 @@
+{"agentType":"general-purpose","isBuiltIn":true,"description":"Fix tune/holdout review findings (Sonnet)","toolUseId":"toolu_01GJKfgPUEbe1p8eWao47JwK","spawnDepth":1,"requestShape":"background","requestNonInteractive":true,"model":"sonnet","pickedEffortModel":"claude-opus-5-5","finished":true}

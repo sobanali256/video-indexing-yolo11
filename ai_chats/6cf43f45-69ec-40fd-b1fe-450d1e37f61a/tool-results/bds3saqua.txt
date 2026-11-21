@@ -1,0 +1,765 @@
+=== tools/batch_agreement.py
+     1	"""Batch vs single-frame inference, and classes-filter vs no-filter (needs the model, i.e. a GPU box).
+     2	
+     3	    python tools/batch_agreement.py --input finevideo --frames 1000
+     4	
+     5	Targets: batch vs single >= 0.999 identical frames; filter vs no filter identical.
+     6	"""
+     7	import argparse
+     8	import sys
+     9	from pathlib import Path
+    10	
+    11	sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    12	
+    13	from vidx.decode import decode_video  # noqa: E402
+    14	from vidx.model import infer, load_model  # noqa: E402
+    15	from vidx.source import iter_rows  # noqa: E402
+    16	
+    17	
+    18	def collect(input_dir, n):
+    19	    """Up to n frames: every 15th frame of the first videos, so several videos are used."""
+    20	    images = []
+    21	    for path in sorted(Path(input_dir).glob("*.parquet")):
+    22	        for _, data, err in iter_rows(path):
+    23	            if err:
+    24	                continue
+    25	            try:
+    26	                for i, f in enumerate(decode_video(data)):
+    27	                    if i % 15 == 0:
+    28	                        images.append(f.image)
+    29	                        if len(images) >= n:
+    30	                            return images
+    31	            except Exception as e:
+    32	                print("decode problem, skipping rest of video:", e, file=sys.stderr)
+    33	    return images
+    34	
+    35	
+    36	def main():
+    37	    ap = argparse.ArgumentParser()
+    38	    ap.add_argument("--input", required=True)
+    39	    ap.add_argument("--frames", type=int, default=1000)
+    40	    ap.add_argument("--batch", type=int, default=32)
+    41	    args = ap.parse_args()
+    42	    model = load_model()
+    43	    images = collect(args.input, args.frames)
+    44	    print(f"{len(images)} frames collected")
+    45	
+    46	    single = [infer(model, [im])[0] for im in images]
+    47	    batched = []
+    48	    i = 0
+    49	    while i < len(images):  # same flush rule as run.py: a batch holds one frame shape only
+    50	        j = i + 1
+    51	        while j < len(images) and j - i < args.batch and images[j].shape == images[i].shape:
+    52	            j += 1
+    53	        batched += infer(model, images[i:j])
+    54	        i = j
+    55	    unfiltered = [infer(model, [im], classes=None)[0] for im in images]
+    56	
+    57	    def same(a, b):
+    58	        return sum(1 for x, y in zip(a, b) if x[0] == y[0]) / max(len(a), 1)
+    59	
+    60	    def max_conf_gap(a, b):
+    61	        return max((abs(p - q) for x, y in zip(a, b) for p, q in zip(x[1], y[1])), default=0.0)
+    62	
+    63	    print(f"batch vs single:        identical counts {same(single, batched):.4f} (need >= 0.999), "
+    64	          f"max conf gap {max_conf_gap(single, batched):.5f}")
+    65	    print(f"classes filter vs none: identical counts {same(single, unfiltered):.4f} (need 1.0), "
+    66	          f"max conf gap {max_conf_gap(single, unfiltered):.5f}")
+    67	
+    68	
+    69	if __name__ == "__main__":
+    70	    main()
+=== tools/check_schema.py
+     1	"""Check a results file against the output format. Exit 1 if anything is wrong.
+     2	
+     3	    python tools/check_schema.py results.jsonl
+     4	"""
+     5	import json
+     6	import sys
+     7	from collections import defaultdict
+     8	from pathlib import Path
+     9	
+    10	sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    11	
+    12	from vidx.aggregate import OBJECTS  # noqa: E402
+    13	
+    14	
+    15	def check(path):
+    16	    problems = []
+    17	    seconds = defaultdict(list)
+    18	    errors = defaultdict(int)
+    19	    with open(path, encoding="utf-8") as f:
+    20	        for n, raw in enumerate(f, 1):
+    21	            if not raw.strip():
+    22	                continue
+    23	            try:
+    24	                d = json.loads(raw)
+    25	            except ValueError:
+    26	                problems.append(f"line {n}: not valid JSON")
+    27	                continue
+    28	            if not isinstance(d, dict):
+    29	                problems.append(f"line {n}: not a JSON object")
+    30	                continue
+    31	            video = d.get("video")
+    32	            if not isinstance(video, str) or ":" not in video:
+    33	                problems.append(f"line {n}: bad video id {video!r}")
+    34	                continue
+    35	            if "error" in d:
+    36	                if set(d) != {"video", "error"} or not isinstance(d["error"], str):
+    37	                    problems.append(f"line {n}: malformed error line")
+    38	                errors[video] += 1
+    39	                continue
+    40	            if set(d) != {"video", "second", "objects", "people"}:
+    41	                problems.append(f"line {n}: wrong keys {sorted(d)}")
+    42	                continue
+    43	            sec, objs, ppl = d["second"], d["objects"], d["people"]
+    44	            if not isinstance(sec, int) or isinstance(sec, bool) or sec < 0:
+    45	                problems.append(f"line {n}: bad second {sec!r}")
+    46	            if not isinstance(ppl, int) or isinstance(ppl, bool) or ppl < 0:
+    47	                problems.append(f"line {n}: bad people {ppl!r}")
+    48	            if not isinstance(objs, list) or any(o not in OBJECTS for o in objs):
+    49	                problems.append(f"line {n}: bad objects {objs!r}")
+    50	            elif objs != [o for o in OBJECTS if o in objs]:
+    51	                problems.append(f"line {n}: objects not unique/in canonical order {objs!r}")
+    52	            seconds[video].append(sec)
+    53	    for video, secs in seconds.items():
+    54	        if sorted(secs) != list(range(len(secs))):
+    55	            problems.append(f"{video}: seconds not contiguous from 0 (got {len(secs)} lines, max {max(secs)})")
+    56	    for video, n in errors.items():
+    57	        if n > 1:
+    58	            problems.append(f"{video}: {n} error lines")
+    59	    print(f"{len(seconds)} videos with seconds, {len(errors)} with error lines")
+    60	    return problems
+    61	
+    62	
+    63	def main():
+    64	    if len(sys.argv) != 2:
+    65	        raise SystemExit(__doc__)
+    66	    problems = check(sys.argv[1])
+    67	    for p in problems[:50]:
+    68	        print("PROBLEM:", p)
+    69	    if len(problems) > 50:
+    70	        print(f"... and {len(problems) - 50} more")
+    71	    print("schema OK" if not problems else f"{len(problems)} problems")
+    72	    return 1 if problems else 0
+    73	
+    74	
+    75	if __name__ == "__main__":
+    76	    sys.exit(main())
+=== tools/decoder_agreement.py
+     1	"""Score PyAV decoding against cv2.VideoCapture on N videos (needs the model, i.e. a GPU box).
+     2	
+     3	    python tools/decoder_agreement.py --input finevideo --n 20
+     4	
+     5	Both decoders go through the same model and aggregation; the PyAV result is the
+     6	reference. Agreement below ~0.99 means: ask the user which decoder is the reference.
+     7	"""
+     8	import argparse
+     9	import os
+    10	import sys
+    11	import tempfile
+    12	from fractions import Fraction
+    13	from pathlib import Path
+    14	
+    15	sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    16	
+    17	import score  # noqa: E402
+    18	from run import Timers, process_frames, video_lines  # noqa: E402
+    19	from vidx.decode import Frame, decode_video  # noqa: E402
+    20	from vidx.model import infer, load_model  # noqa: E402
+    21	from vidx.source import iter_rows  # noqa: E402
+    22	
+    23	
+    24	def cv2_frames(data):
+    25	    import cv2
+    26	
+    27	    fd, tmp = tempfile.mkstemp(suffix=".mp4")
+    28	    try:
+    29	        with os.fdopen(fd, "wb") as f:
+    30	            f.write(memoryview(data))
+    31	        cap = cv2.VideoCapture(tmp)  # applies rotation metadata on its own
+    32	        first = None
+    33	        while True:
+    34	            ok, image = cap.read()
+    35	            if not ok:
+    36	                break
+    37	            ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+    38	            t = Fraction(ms / 1000.0).limit_denominator(1_000_000)
+    39	            first = t if first is None else first
+    40	            yield Frame(image, max(t - first, Fraction(0)), None, 0)
+    41	        cap.release()
+    42	    finally:
+    43	        os.remove(tmp)
+    44	
+    45	
+    46	def lines_for(video_id, frames, infer_fn, batch):
+    47	    records, error = process_frames(frames, infer_fn, batch, Timers())
+    48	    return video_lines(video_id, records, error), len(records)
+    49	
+    50	
+    51	def main():
+    52	    ap = argparse.ArgumentParser()
+    53	    ap.add_argument("--input", required=True)
+    54	    ap.add_argument("--n", type=int, default=20)
+    55	    ap.add_argument("--batch", type=int, default=32)
+    56	    args = ap.parse_args()
+    57	    model = load_model()
+    58	
+    59	    def infer_fn(images):
+    60	        return infer(model, images)
+    61	
+    62	    ref_lines, cand_lines = [], []
+    63	    done = 0
+    64	    for path in sorted(Path(args.input).glob("*.parquet")):
+    65	        for video_id, data, err in iter_rows(path):
+    66	            if err:
+    67	                continue
+    68	            a, na = lines_for(video_id, decode_video(data), infer_fn, args.batch)
+    69	            b, nb = lines_for(video_id, cv2_frames(data), infer_fn, args.batch)
+    70	            print(f"{video_id}: pyav {na} frames, cv2 {nb} frames")
+    71	            ref_lines += a
+    72	            cand_lines += b
+    73	            done += 1
+    74	            if done >= args.n:
+    75	                break
+    76	        if done >= args.n:
+    77	            break
+    78	    m = score.compute(score.parse_lines(ref_lines), score.parse_lines(cand_lines))
+    79	    score.report(m)
+    80	    print(f"decoder agreement (micro F1): {m['micro_f1']:.4f}  (< 0.99: ask the user which decoder is the reference)")
+    81	
+    82	
+    83	if __name__ == "__main__":
+    84	    main()
+=== tools/find_rotated.py
+     1	"""Scan parquet files for videos carrying rotation metadata.
+     2	
+     3	    python tools/find_rotated.py --input finevideo --max-files 2
+     4	"""
+     5	import argparse
+     6	import sys
+     7	from pathlib import Path
+     8	
+     9	sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    10	
+    11	from vidx.decode import probe_rotation  # noqa: E402
+    12	from vidx.source import iter_rows  # noqa: E402
+    13	
+    14	
+    15	def main():
+    16	    ap = argparse.ArgumentParser()
+    17	    ap.add_argument("--input", required=True)
+    18	    ap.add_argument("--max-files", type=int, default=2)
+    19	    args = ap.parse_args()
+    20	    files = sorted(Path(args.input).glob("*.parquet"))[: args.max_files]
+    21	    scanned = found = 0
+    22	    for path in files:
+    23	        for video_id, data, err in iter_rows(path):
+    24	            if err:
+    25	                continue
+    26	            scanned += 1
+    27	            try:
+    28	                stream_rot, frame_rot, tag = probe_rotation(data)
+    29	            except Exception as e:
+    30	                print(f"{video_id}: probe failed: {e}", file=sys.stderr)
+    31	                continue
+    32	            if stream_rot or frame_rot or tag not in (None, "", "0"):
+    33	                found += 1
+    34	                print(f"{video_id}: stream_rotation_ccw={stream_rot} frame_rotation_ccw={frame_rot} rotate_tag={tag}")
+    35	    print(f"scanned {scanned} videos, {found} with rotation metadata")
+    36	
+    37	
+    38	if __name__ == "__main__":
+    39	    main()
+=== tests/test_aggregate.py
+     1	import os
+     2	import sys
+     3	import unittest
+     4	from fractions import Fraction as F
+     5	
+     6	sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+     7	
+     8	from vidx.aggregate import OBJECTS, aggregate, error_line, make_lines, median_floor  # noqa: E402
+     9	
+    10	
+    11	def c(person=0, car=0, dog=0, laptop=0, phone=0):
+    12	    return [person, car, dog, laptop, phone]
+    13	
+    14	
+    15	class MedianTest(unittest.TestCase):
+    16	    def test_floor_at_half(self):
+    17	        self.assertEqual(median_floor([1, 2]), 1)  # 1.5 -> 1
+    18	        self.assertEqual(median_floor([0, 1]), 0)
+    19	        self.assertEqual(median_floor([2, 3]), 2)
+    20	
+    21	    def test_odd_even(self):
+    22	        self.assertEqual(median_floor([3, 1, 2]), 2)
+    23	        self.assertEqual(median_floor([1, 1, 3, 3]), 2)
+    24	        self.assertEqual(median_floor([5]), 5)
+    25	        self.assertEqual(median_floor([]), 0)
+    26	
+    27	
+    28	class AggregateTest(unittest.TestCase):
+    29	    def test_half_rule_even(self):
+    30	        # 2 of 4 frames -> present (hits*2 >= n)
+    31	        frames = [(F(i, 10), c(car=1 if i < 2 else 0)) for i in range(4)]
+    32	        self.assertEqual(aggregate(frames), [(0, ["car"], 0)])
+    33	
+    34	    def test_half_rule_below(self):
+    35	        frames = [(F(i, 10), c(car=1 if i < 1 else 0)) for i in range(4)]
+    36	        self.assertEqual(aggregate(frames), [(0, [], 0)])
+    37	
+    38	    def test_half_rule_odd(self):
+    39	        # n=3: 1 hit is not enough, 2 hits is
+    40	        one = [(F(i, 10), c(dog=1 if i == 0 else 0)) for i in range(3)]
+    41	        two = [(F(i, 10), c(dog=1 if i < 2 else 0)) for i in range(3)]
+    42	        self.assertEqual(aggregate(one), [(0, [], 0)])
+    43	        self.assertEqual(aggregate(two), [(0, ["dog"], 0)])
+    44	
+    45	    def test_single_frame_second(self):
+    46	        self.assertEqual(aggregate([(F(0), c(laptop=2, person=1))]), [(0, ["person", "laptop"], 1)])
+    47	
+    48	    def test_object_order_fixed(self):
+    49	        row = aggregate([(F(0), c(phone=1, laptop=1, dog=1, car=1, person=1))])
+    50	        self.assertEqual(row[0][1], OBJECTS)
+    51	        self.assertEqual(OBJECTS, ["person", "car", "dog", "laptop", "cell phone"])
+    52	
+    53	    def test_people_median_floor(self):
+    54	        frames = [(F(0), c(person=1)), (F(1, 4), c(person=2))]  # median 1.5 -> 1
+    55	        self.assertEqual(aggregate(frames)[0][2], 1)
+    56	
+    57	    def test_person_object_but_median_zero(self):
+    58	        frames = [(F(0), c(person=1)), (F(1, 4), c(person=0)), (F(1, 2), c(person=0)), (F(3, 4), c(person=1))]
+    59	        self.assertEqual(aggregate(frames), [(0, ["person"], 0)])  # 2/4 frames, median 0.5 -> 0
+    60	
+    61	    def test_empty_seconds_filled(self):
+    62	        rows = aggregate([(F(0), c(car=1)), (F(3, 1), c(person=2))])
+    63	        self.assertEqual(rows, [(0, ["car"], 0), (1, [], 0), (2, [], 0), (3, ["person"], 2)])
+    64	
+    65	    def test_second_boundary_exact(self):
+    66	        rows = aggregate([(F(999, 1000), c()), (F(1), c(person=1))])
+    67	        self.assertEqual([r[0] for r in rows], [0, 1])
+    68	
+    69	    def test_no_frames(self):
+    70	        self.assertEqual(aggregate([]), [])
+    71	
+    72	    def test_partial_last_second(self):
+    73	        # video failed after 0.2 s of second 2: partial second is aggregated from what exists
+    74	        frames = [(F(0), c()), (F(1), c()), (F(2), c(person=1)), (F(21, 10), c(person=1))]
+    75	        self.assertEqual(aggregate(frames)[-1], (2, ["person"], 1))
+    76	
+    77	    def test_lines(self):
+    78	        self.assertEqual(
+    79	            make_lines("a.parquet:3", [(0, ["car"], 1)]),
+    80	            [{"video": "a.parquet:3", "second": 0, "objects": ["car"], "people": 1}],
+    81	        )
+    82	        self.assertEqual(error_line("a.parquet:3", "x"), {"video": "a.parquet:3", "error": "x"})
+    83	
+    84	
+    85	if __name__ == "__main__":
+    86	    unittest.main()
+=== tests/test_decode.py
+     1	import os
+     2	import sys
+     3	import unittest
+     4	from fractions import Fraction as F
+     5	
+     6	sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+     7	
+     8	from vidx.decode import Timestamper, normalize_rotation  # noqa: E402
+     9	
+    10	
+    11	class TimestamperTest(unittest.TestCase):
+    12	    def test_exact_from_first_pts(self):
+    13	        ts = Timestamper(F(1, 90000), F(30))
+    14	        self.assertEqual(ts.stamp(9000), F(0))
+    15	        self.assertEqual(ts.stamp(12003), F(3003, 90000))
+    16	        self.assertEqual(ts.stamp(9000 + 90000), F(1))
+    17	
+    18	    def test_negative_pts_clamped(self):
+    19	        ts = Timestamper(F(1, 1000), F(25))
+    20	        self.assertEqual(ts.stamp(100), F(0))
+    21	        self.assertEqual(ts.stamp(60), F(0))  # earlier than the first frame
+    22	        self.assertEqual(ts.clamped, 1)
+    23	        self.assertEqual(ts.stamp(140), F(40, 1000))
+    24	
+    25	    def test_negative_first_pts_ok(self):
+    26	        ts = Timestamper(F(1, 1000), None)
+    27	        self.assertEqual(ts.stamp(-500), F(0))
+    28	        self.assertEqual(ts.stamp(-460), F(40, 1000))
+    29	
+    30	    def test_missing_pts_uses_rate(self):
+    31	        ts = Timestamper(F(1, 1000), F(25))
+    32	        self.assertEqual(ts.stamp(0), F(0))
+    33	        self.assertEqual(ts.stamp(None), F(1, 25))
+    34	        self.assertEqual(ts.stamp(None), F(2, 25))
+    35	        self.assertEqual(ts.fallbacks, 2)
+    36	
+    37	    def test_missing_pts_without_rate_uses_index_over_30(self):
+    38	        ts = Timestamper(F(1, 1000), None)
+    39	        self.assertEqual(ts.stamp(None), F(0))
+    40	        self.assertEqual(ts.stamp(None), F(1, 30))
+    41	        self.assertEqual(ts.stamp(None), F(2, 30))
+    42	
+    43	    def test_no_time_base(self):
+    44	        ts = Timestamper(None, F(10))
+    45	        self.assertEqual(ts.stamp(5), F(0))
+    46	        self.assertEqual(ts.stamp(6), F(1, 10))
+    47	
+    48	
+    49	class RotationTest(unittest.TestCase):
+    50	    def test_normalize(self):
+    51	        self.assertEqual(normalize_rotation(0), 0)
+    52	        self.assertEqual(normalize_rotation(90), 90)
+    53	        self.assertEqual(normalize_rotation(-90), 270)
+    54	        self.assertEqual(normalize_rotation(180), 180)
+    55	        self.assertEqual(normalize_rotation(-180), 180)
+    56	        self.assertEqual(normalize_rotation(450), 90)
+    57	        self.assertEqual(normalize_rotation(89.9), 90)
+    58	        self.assertEqual(normalize_rotation(None), 0)
+    59	        self.assertEqual(normalize_rotation("x"), 0)
+    60	
+    61	
+    62	if __name__ == "__main__":
+    63	    unittest.main()
+=== tests/test_output.py
+     1	import json
+     2	import os
+     3	import sys
+     4	import tempfile
+     5	import unittest
+     6	from pathlib import Path
+     7	
+     8	sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+     9	
+    10	from vidx.output import OutputWriter, sidecar_path  # noqa: E402
+    11	
+    12	
+    13	def lines_for(video, n):
+    14	    return [{"video": video, "second": s, "objects": [], "people": 0} for s in range(n)]
+    15	
+    16	
+    17	class OutputTest(unittest.TestCase):
+    18	    def setUp(self):
+    19	        self.tmp = tempfile.TemporaryDirectory()
+    20	        self.out = Path(self.tmp.name) / "results.jsonl"
+    21	
+    22	    def tearDown(self):
+    23	        self.tmp.cleanup()
+    24	
+    25	    def read(self):
+    26	        return [json.loads(x) for x in self.out.read_text(encoding="utf-8").splitlines()]
+    27	
+    28	    def test_write_and_sidecar(self):
+    29	        w = OutputWriter(self.out)
+    30	        w.write_video("a:0", lines_for("a:0", 2))
+    31	        w.write_video("a:1", [{"video": "a:1", "error": "bad"}])
+    32	        w.close()
+    33	        self.assertEqual(len(self.read()), 3)
+    34	        self.assertEqual(sidecar_path(self.out).read_text().split(), ["a:0", "a:1"])
+    35	
+    36	    def test_fresh_run_resets_old_files(self):
+    37	        w = OutputWriter(self.out)
+    38	        w.write_video("a:0", lines_for("a:0", 2))
+    39	        w.close()
+    40	        w = OutputWriter(self.out)  # no resume: start over
+    41	        w.close()
+    42	        self.assertEqual(self.out.read_text(), "")
+    43	        self.assertEqual(sidecar_path(self.out).read_text(), "")
+    44	
+    45	    def test_resume_drops_half_written_video(self):
+    46	        w = OutputWriter(self.out)
+    47	        w.write_video("a:0", lines_for("a:0", 2))
+    48	        w.close()
+    49	        # crash: lines of a:1 reached the output (one truncated), sidecar never got a:1
+    50	        with open(self.out, "a", encoding="utf-8") as f:
+    51	            f.write(json.dumps(lines_for("a:1", 1)[0]) + "\n")
+    52	            f.write('{"video": "a:1", "sec')
+    53	        w = OutputWriter(self.out, resume=True)
+    54	        self.assertTrue(w.is_done("a:0"))
+    55	        self.assertFalse(w.is_done("a:1"))
+    56	        w.write_video("a:1", lines_for("a:1", 3))
+    57	        w.close()
+    58	        rows = self.read()
+    59	        self.assertEqual([r["video"] for r in rows], ["a:0", "a:0", "a:1", "a:1", "a:1"])
+    60	
+    61	    def test_resume_ignores_truncated_sidecar_entry(self):
+    62	        w = OutputWriter(self.out)
+    63	        w.write_video("a:1", lines_for("a:1", 1))
+    64	        w.close()
+    65	        with open(sidecar_path(self.out), "a", encoding="utf-8") as f:
+    66	            f.write("a:1")  # "a:1x" truncated mid-write, no newline
+    67	        with open(self.out, "a", encoding="utf-8") as f:
+    68	            f.write(json.dumps(lines_for("a:12", 1)[0]) + "\n")
+    69	        w = OutputWriter(self.out, resume=True)
+    70	        self.assertEqual(w.done, {"a:1"})
+    71	        w.close()
+    72	        self.assertEqual([r["video"] for r in self.read()], ["a:1"])
+    73	
+    74	    def test_resume_without_existing_files(self):
+    75	        w = OutputWriter(self.out, resume=True)
+    76	        self.assertEqual(w.done, set())
+    77	        w.close()
+    78	
+    79	
+    80	if __name__ == "__main__":
+    81	    unittest.main()
+=== tests/test_run.py
+     1	import os
+     2	import sys
+     3	import unittest
+     4	from fractions import Fraction as F
+     5	from types import SimpleNamespace
+     6	
+     7	sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+     8	
+     9	import run  # noqa: E402
+    10	from vidx.decode import Frame  # noqa: E402
+    11	from vidx.model import summarize  # noqa: E402
+    12	
+    13	
+    14	def frame(t, shape=(4, 6, 3), person=0):
+    15	    return Frame(SimpleNamespace(shape=shape, person=person), t, None, 0)
+    16	
+    17	
+    18	class FakeInfer:
+    19	    """Counts persons from the fake image; remembers each batch it was given."""
+    20	
+    21	    def __init__(self, fail_on_call=None):
+    22	        self.batches = []
+    23	        self.fail_on_call = fail_on_call
+    24	
+    25	    def __call__(self, images):
+    26	        self.batches.append([im.shape for im in images])
+    27	        if self.fail_on_call == len(self.batches):
+    28	            raise RuntimeError("cuda oom")
+    29	        return [([im.person, 0, 0, 0, 0], [0.9, 0, 0, 0, 0]) for im in images]
+    30	
+    31	
+    32	class ProcessFramesTest(unittest.TestCase):
+    33	    def test_batching(self):
+    34	        fi = FakeInfer()
+    35	        frames = [frame(F(i, 10)) for i in range(7)]
+    36	        records, error = run.process_frames(iter(frames), fi, 3, run.Timers())
+    37	        self.assertIsNone(error)
+    38	        self.assertEqual(len(records), 7)
+    39	        self.assertEqual([len(b) for b in fi.batches], [3, 3, 1])
+    40	
+    41	    def test_flush_on_shape_change(self):
+    42	        fi = FakeInfer()
+    43	        shapes = [(4, 6, 3)] * 2 + [(6, 4, 3)] * 2 + [(4, 6, 3)]
+    44	        frames = [frame(F(i, 10), shape=s) for i, s in enumerate(shapes)]
+    45	        records, _ = run.process_frames(iter(frames), fi, 32, run.Timers())
+    46	        self.assertEqual([len(b) for b in fi.batches], [2, 2, 1])
+    47	        self.assertEqual([r.shape for r in records], shapes)
+    48	
+    49	    def test_decode_failure_keeps_partial_second(self):
+    50	        def gen():
+    51	            yield frame(F(0), person=1)
+    52	            yield frame(F(1), person=1)
+    53	            yield frame(F(21, 10), person=2)  # part of second 2
+    54	            raise ValueError("corrupt packet")
+    55	
+    56	        records, error = run.process_frames(gen(), FakeInfer(), 32, run.Timers())
+    57	        self.assertIn("corrupt packet", error)
+    58	        self.assertEqual(len(records), 3)
+    59	        lines = run.video_lines("a.parquet:7", records, error)
+    60	        self.assertEqual([l.get("second") for l in lines[:-1]], [0, 1, 2])
+    61	        self.assertEqual(lines[2]["people"], 2)  # partial second 2 emitted
+    62	        self.assertEqual(lines[2]["objects"], ["person"])
+    63	        self.assertEqual(set(lines[-1]), {"video", "error"})
+    64	
+    65	    def test_failure_before_any_frame(self):
+    66	        def gen():
+    67	            raise ValueError("moov atom not found")
+    68	            yield
+    69	
+    70	        records, error = run.process_frames(gen(), FakeInfer(), 32, run.Timers())
+    71	        lines = run.video_lines("a.parquet:7", records, error)
+    72	        self.assertEqual(len(lines), 1)
+    73	        self.assertIn("error", lines[0])
+    74	
+    75	    def test_zero_frames_without_exception_is_error(self):
+    76	        records, error = run.process_frames(iter([]), FakeInfer(), 32, run.Timers())
+    77	        lines = run.video_lines("v:0", records, error)
+    78	        self.assertEqual(lines, [{"video": "v:0", "error": "no frames decoded"}])
+    79	
+    80	    def test_inference_failure_returns_earlier_batches(self):
+    81	        frames = [frame(F(i, 10)) for i in range(6)]
+    82	        records, error = run.process_frames(iter(frames), FakeInfer(fail_on_call=2), 3, run.Timers())
+    83	        self.assertEqual(len(records), 3)
+    84	        self.assertIn("cuda oom", error)
+    85	
+    86	    def test_clean_video_has_no_error_line(self):
+    87	        records, error = run.process_frames(iter([frame(F(0)), frame(F(1, 2))]), FakeInfer(), 8, run.Timers())
+    88	        lines = run.video_lines("v:1", records, error)
+    89	        self.assertEqual(lines, [{"video": "v:1", "second": 0, "objects": [], "people": 0}])
+    90	
+    91	
+    92	class SummarizeTest(unittest.TestCase):
+    93	    def test_summarize(self):
+    94	        counts, best = summarize([0, 0, 2, 67, 5], [0.5, 0.9, 0.6, 0.41, 0.99])
+    95	        self.assertEqual(counts, [2, 1, 0, 0, 1])  # class 5 (bus) ignored
+    96	        self.assertEqual(best, [0.9, 0.6, 0.0, 0.0, 0.41])
+    97	
+    98	
+    99	if __name__ == "__main__":
+   100	    unittest.main()
+=== tests/test_score.py
+     1	import contextlib
+     2	import io
+     3	import os
+     4	import sys
+     5	import unittest
+     6	
+     7	sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+     8	
+     9	import score  # noqa: E402
+    10	
+    11	
+    12	def sec(video, s, objects=(), people=0):
+    13	    return {"video": video, "second": s, "objects": list(objects), "people": people}
+    14	
+    15	
+    16	def metrics(ref, cand):
+    17	    return score.compute(score.parse_lines(ref), score.parse_lines(cand))
+    18	
+    19	
+    20	class ScoreTest(unittest.TestCase):
+    21	    def test_identical(self):
+    22	        ref = [sec("v:0", 0, ["person"], 2), sec("v:0", 1, ["car", "dog"], 0), sec("v:1", 0, [], 0)]
+    23	        m = metrics(ref, list(ref))
+    24	        self.assertEqual(m["micro_f1"], 1.0)
+    25	        self.assertEqual(m["macro_f1"], 1.0)
+    26	        self.assertEqual(m["people_exact"], 1.0)
+    27	        self.assertEqual(m["people_within1"], 1.0)
+    28	        with contextlib.redirect_stdout(io.StringIO()):
+    29	            self.assertTrue(score.report(m))
+    30	
+    31	    def test_both_empty_is_perfect(self):
+    32	        ref = [sec("v:0", 0), sec("v:0", 1)]
+    33	        m = metrics(ref, list(ref))
+    34	        self.assertEqual(m["micro_f1"], 1.0)
+    35	        self.assertEqual(m["video_f1"]["v:0"], 1.0)
+    36	
+    37	    def test_missing_seconds_count_as_empty(self):
+    38	        ref = [sec("v:0", 0, ["car"], 1), sec("v:0", 1, [], 0)]
+    39	        cand = [sec("v:0", 1, [], 0)]
+    40	        m = metrics(ref, cand)
+    41	        self.assertEqual(m["missing_seconds"], 1)
+    42	        self.assertEqual(m["micro_f1"], 0.0)  # tp 0, fn 1
+    43	        self.assertEqual(m["people_exact"], 0.5)  # 1 vs predicted 0 is wrong; empty second matches
+    44	        self.assertEqual(m["people_within1"], 1.0)
+    45	
+    46	    def test_extra_seconds_are_false_positives(self):
+    47	        ref = [sec("v:0", 0, ["car"], 0)]
+    48	        cand = [sec("v:0", 0, ["car"], 0), sec("v:0", 1, ["dog", "car"], 3)]
+    49	        m = metrics(ref, cand)
+    50	        self.assertEqual(m["extra_seconds"], 1)
+    51	        self.assertAlmostEqual(m["micro_f1"], 2 * 1 / (2 * 1 + 2 + 0))
+    52	        self.assertEqual(m["people_exact"], 1.0)  # people only judged on reference seconds
+    53	
+    54	    def test_people_tolerance(self):
+    55	        ref = [sec("v:0", i, [], 2) for i in range(4)]
+    56	        cand = [sec("v:0", 0, [], 2), sec("v:0", 1, [], 3), sec("v:0", 2, [], 1), sec("v:0", 3, [], 5)]
+    57	        m = metrics(ref, cand)
+    58	        self.assertEqual(m["people_exact"], 0.25)
+    59	        self.assertEqual(m["people_within1"], 0.75)
+    60	
+    61	    def test_thresholds_fail(self):
+    62	        ref = [sec("v:0", i, ["car"], 0) for i in range(10)]
+    63	        cand = [sec("v:0", i, [] if i < 2 else ["car"], 0) for i in range(10)]
+    64	        with contextlib.redirect_stdout(io.StringIO()):
+    65	            self.assertFalse(score.report(metrics(ref, cand)))
+    66	
+    67	    def test_error_lines_counted_separately(self):
+    68	        ref = [sec("v:0", 0, ["car"], 0), {"video": "v:1", "error": "bad"}]
+    69	        cand = [sec("v:0", 0, ["car"], 0), {"video": "v:2", "error": "bad"}]
+    70	        m = metrics(ref, cand)
+    71	        self.assertEqual((m["ref_errors"], m["cand_errors"], m["error_mismatch"]), (1, 1, 2))
+    72	        self.assertEqual(m["micro_f1"], 1.0)
+    73	
+    74	    def test_empty_files(self):
+    75	        m = metrics([], [])
+    76	        self.assertEqual((m["micro_f1"], m["people_exact"], m["people_within1"]), (1.0, 1.0, 1.0))
+    77	
+    78	
+    79	if __name__ == "__main__":
+    80	    unittest.main()
+# video-indexing-yolo11
+
+Per-second object indexing of FineVideo with Ultralytics YOLO11l (person, car, dog, laptop, cell phone + people count), optimised for speed.
+
+> Work in progress: the current `run.py` is the correct every-frame baseline. The performance section will be filled in once the speed-ups are validated.
+
+## Install (Ubuntu 22.04, Python 3.11, CUDA 12)
+```
+sudo apt-get install -y libgl1 libglib2.0-0     # runtime libs for OpenCV
+python3.11 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+## Prepare (untimed, needs internet)
+Downloads `yolo11l.pt` next to `run.py` and loads it once to check it works.
+```
+python prepare.py
+```
+
+## Run (no internet needed)
+```
+python run.py --input <folder of .parquet files> --output results.jsonl
+```
+Optional flags: `--batch 32`, `--resume` (continue an interrupted run via `results.jsonl.done`), `--limit-videos N`, `--dump-frames DIR` (per-frame npz for offline experiments). Stage timings (decode / infer / aggregate / total) are printed to stderr.
+
+## Score a result against a reference
+```
+python score.py reference.jsonl candidate.jsonl
+```
+
+## Tests (CPU, standard library only)
+```
+python -m unittest discover -s tests -v
+```
+
+Colab L4 workflow: see `colab/SETUP.md`.
+
+## Performance
+Work in progress.
+# --- Private (never commit) ---
+.claude/settings.local.json
+.env
+*.token
+hf_token*
+
+# Assignment brief (kept locally only)
+AI_Engineering_TakeHome_Brief.pdf
+
+# --- Data & models (too large / downloaded by prep step) ---
+finevideo/
+data/
+*.parquet
+*.mp4
+*.pt
+*.engine
+*.onnx
+*.torchscript
+
+# --- Outputs (only the gzipped final results are committed) ---
+results.jsonl
+*.jsonl.tmp
+runs/
+reference/
+bench/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+.pytest_cache/
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.vscode/

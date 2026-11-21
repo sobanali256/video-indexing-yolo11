@@ -1,0 +1,208 @@
+- [ ] Test `source.py` (never run locally: pip downloads were too slow; helper script idea: small synthetic parquet incl. a corrupt file and a null mp4) and then against real FineVideo parquet (row-group layout, `as_buffer()` on the mp4 column)
+- [ ] Speed optimisations (iterative, each validated)
+- [ ] Resumable full run on all 50 files -> results.jsonl.gz
+- [ ] HARDWARE.md (Colab L4 specs + full-run time)
+- [ ] README.md performance section
+- [ ] WRITEUP.md: **user writes this, no AI**
+- [ ] ai_chats/: copy Claude Code .jsonl, redact tokens, add web links
+- [ ] Final secret scan + push before deadline
+
+## Completed
+- 2026-11-21: **6.6 re-run with the 54-pin requirements.txt (commit a3237a2):** fresh Python 3.11 venv, plain `pip install -r requirements.txt` → torch 2.6.0+cu126 (CUDA True), ultralytics 8.3.100, av 14.2.0; prepare.py "model OK on cuda:0"; 2-video run OK (1,547 fps). The freeze equals requirements.txt (54 pins, diffed). **The grader install path is verified.** bench_log.csv re-copied from Drive (34 runs incl. the threads 2/3/4 rows).
+  - **Code side complete.** Remaining: ai_chats/ (export + redaction, last), WRITEUP.md (user, no AI), final secret scan + push before Sun 22 Nov 23:55 PKT.
+- 2026-11-21: **uv vs pip with the 54 pins:** Colab cell 0.1 (`uv pip install`) failed with "no version of certifi==2026.11.20". uv uses the first index that has a package and checks the extra index (download.pytorch.org/whl/cu126) first. That index mirrors old versions of certifi, filelock, pillow, numpy, etc. Plain pip (the grader) merges all indexes and picks the best match, which is how 6.6 produced these exact versions. Fix: `--index-strategy unsafe-best-match` on every `uv pip install` (speedup.ipynb 0.1, baseline.ipynb, SETUP.md) plus a README note. requirements.txt unchanged. This also means the full run's venv (uv, direct pins only) took some transitive packages from the PyTorch index (older versions); results do not depend on them.
+- 2026-11-21: **Final checks (speedup.ipynb section 6, L4, commit 07122bc): all PASS.**
+  - 6.1 OS **Ubuntu 24.04.4 LTS** (Colab container, kernel 6.6.159+); disk **NVMe SSD** (ROTA 0) → HARDWARE.md filled in.
+  - 6.2 decode threads 2 / 3 / 4 on tune: **byte-identical sorted output** (9,144 lines), all F1 0.9878 / exact 0.9588 / within1 0.9989. Speed 1,855 / 1,872 / 1,857 fps (L4 GPU-bound: no gain here; the gain is for faster GPUs, not measured on a 4090). `auto` (3 on 12 CPUs) is the default; performance-only change after results-v1, the 50 files were not re-run.
+  - 6.3 rotation:
+    - 0 of 1,650 videos in the 50 files carry rotation metadata.
+    - On rotated copies of a real video (ffmpeg 6.1 `-display_rotation` 90/180/270), our decoder matches ffmpeg's autorotated first frame exactly: shape swapped as expected, mean difference 0.00. The angle arrives via `frame.rotation`; stream side data gave 0. **Rotation check closed.**
+  - 6.4 damaged inputs: exit 0. Valid videos have seconds; truncated and zeroed-block mp4 keep 73 / 101 seconds + 1 error line; random / null / empty mp4 and corrupt / truncated parquet give exactly 1 error line each. **Damaged-input check closed.**
+  - 6.5 offline: network namespace isolated (`unshare -n`), all sockets blocked, 0 connection attempts, exit 0, output identical to the online run (3 videos, 1,082 lines). **Offline check closed.**
+  - 6.6 clean install exactly as README: fresh 3.11 venv, plain `pip install -r requirements.txt` OK, `pip check` clean, prepare.py "model OK on cuda:0", 2-video run OK. The `pip freeze` (54 packages) now pins every package in requirements.txt (verified identical to the freeze). **The new file itself still needs one re-run of 6.6** (it now pins `torch==2.6.0+cu126` / `torchvision==0.21.0+cu126` from the cu126 index).
+  - TODO: re-copy `bench_log.csv` from Drive (3 new threads rows) into `worklog/` before the final push.
+- 2026-11-21: **Full review with 3 independent subagents** (brief compliance, code correctness, setup/offline). No code blockers; 180 tests pass. The direct path, timestamps, sampling, aggregation and threading were confirmed correct against the reference semantics; `YOLO_OFFLINE` is honoured in 8.3.100 and nothing downloads at run time.
+  - Gaps found: HARDWARE.md lacks OS and disk type (brief asks for both); README lacked `apt-get update`, `git clone`/`cd`, the Python 3.11 / venv apt line and the driver note; requirements.txt had a stale PROVISIONAL note and pins only direct dependencies; rotation, offline and damaged-input checks were never run.
+  - Decision items reported to the user: decode threads on the 4090 (likely decode-bound with 2), FP16 wording ("Ultralytics defaults"), exit 3 after 3 failed batches (kept).
+  - Fixed (A): README install (clone, apt-get update, python3.11-venv, driver >= 525, disk note, run time), prepare/run notes; requirements note; HARDWARE OS/disk rows added as TO CONFIRM (Colab 6.1).
+- 2026-11-21: **Performance-only change after results-v1: `--decode-threads auto` (new default)** = one thread per 4 CPUs, 2..4 (`run.auto_decode_threads`; 3 on Colab's 12 vCPUs, 4 on the 32-thread grader). It only changes how frames reach the GPU, not which frames. It must give byte-identical sorted output vs 2 threads (Colab 6.2, PENDING); no re-run of the 50 files. Tests added (auto values, arg parsing, stats).
+- 2026-11-21: New checks for Colab section 6:
+  - `tools/rotation_check.py`: our decoder vs ffmpeg autorotate on 90/180/270 copies of a real video;
+  - `tools/make_damaged.py`: truncated / random / null / empty mp4, zeroed block, corrupt + truncated parquet, plus a checker with tests;
+  - 6.5 offline run (all socket connects blocked via sitecustomize, plus `unshare -n` if allowed);
+  - 6.6 clean plain-pip install in a fresh 3.11 venv + `pip freeze` to Drive.
+- 2026-11-20: **FULL 50-FILE RUN DONE (results-v1 = cfd9662, NVIDIA L4, Colab):**
+  - 1,650 videos, 0 errors, 12,981,615 frames (matches count_frames exactly), 1,385,035 inferred (10.7%).
+  - Wall 15:15:36 → 17:07:37 UTC (one session, no resets): compute 6,721.4 s = **1 h 52 min**; loop 6,718.2 s; startup 3.3 s; **1,932 fps**.
+  - Thread-summed decode 5,876 s, infer 6,694 s (GPU-bound).
+  - vs brute force projection 124,936 s (34.7 h): **18.6x**.
+  - check_schema OK. Sanity scores on the reference files: tune 0.9878 / 0.9588 / 0.9989, holdout 0.9902 / 0.9680 / 0.9990 (identical to the Stage 2a gate).
+  - `results.jsonl.gz` (1,386,916 bytes) on Drive at `vidx/results.jsonl.gz`; stats in `vidx/full50.stats.json`, commit/GPU in `vidx/full50.commit.txt`.
+  - Stats `model_speed` includes the warm-up predict (fixed later in c6b4f13; cosmetic).
+  - Next: copy results.jsonl.gz into the repo, HARDWARE.md, README performance section, ai_chats, final secret scan + push. Then optional Stage 3 (TensorRT, needs a re-run).
+- 2026-11-20: **Code review #6 (commit cfd9662)**, 4 findings fixed. None changes results; results-v1 stays the full-run configuration.
+  - (important) `--dump-frames` commands in baseline.ipynb / SETUP.md failed with exit 2 under the new default of 2 threads → reference and dump commands pass `--sample 0 --precision fp32 --decode-threads 0`. The README says dumps need `--decode-threads 0`.
+  - (nit) Brute-force references now stay on plain `predict()` (`--decode-threads 0`), also in the speedup.ipynb profile cell, so the reference never shares code with the direct path it checks.
+  - (nit) 5.4 resume checks out the commit recorded in `full50.commit.txt` before resuming; 5.2 checks out `results-v1` (never a newer main).
+  - (pre-existing) Stats: model.speed is reset after the prepare_direct warm-up.
+- 2026-11-20: **Stage 2a gate PASSED (L4)**, defaults now k=3 + FP16 + **2 decode threads**:
+  - 4.1 direct path vs predict(): identical counts **1.0000, max conf gap 0.00000** in FP32 and FP16 (1,000 frames, 32 batches); predictor args conf 0.4, iou 0.7, classes [0,2,16,63,67], agnostic False, max_det 300, imgsz (640, 640).
+  - 4.2 tune (all F1 0.9878, exact 0.9588, within1 0.9989):
+    - threads 0 (Stage 1 path): **1,214 fps** (infer 159 s, decode 49 s, loop 209 s)
+    - threads 1: **1,934 fps** (loop 131 s, infer 128 s)
+    - threads 2: **1,900 fps** (loop 134 s)
+    - GPU-bound now (infer ≈ loop), per inferred image ~4.7 ms. **18.6x vs brute force on the same L4** (103.9 fps).
+  - 4.3 holdout, threads 2: **F1 0.9902, exact 0.9680, within1 0.9990**, 1,899 fps.
+  - Default 2 threads: no cost on the L4 and decode headroom on the 4090 (GPU ~2.5x faster; 1 thread would become decode-bound). Stage 2b (shared memory) is not needed.
+  - Robustness: if `prepare_direct` fails at startup, run.py logs a warning and falls back to `--decode-threads 0` (test added). Stats JSON records `decode_threads`. FakeRun tests pin `--decode-threads 0` (the pipeline has its own tests). 180 tests pass.
+  - speedup.ipynb section 5: full 50-file run (5.1 download check, 5.2 launch in the background with default flags + Drive checkpoints, 5.3 progress, 5.4 resume, 5.5 schema + sanity scores + gzip to Drive + total time). Projection on the L4: 12.98 M frames / ~1,900 fps ≈ **1.9 h** (vs 34.7 h brute force).
+  - Bench note: with the direct path, `ms/img pre/inf/post` show 0 and everything lands in "other" (infer_tensor does not split the time); cosmetic.
+- 2026-11-20: Stage 2a GPU checks prepared:
+  - `tools/batch_agreement.py --direct --precision fp32|fp16`: predict() vs the direct path on the same frames and batches.
+  - speedup.ipynb section 4: 4.1 agreement, 4.2 tune timing with threads 0/1/2 (labels include the GPU name), 4.3 holdout.
+  - A setup guard on the Stage 1 and Stage 2a cells stops with "run section 0 first" after a reset.
+  - The T4 came from the reconnect; the L4 is still available, so timings run on the L4.
+- 2026-11-20: **Stage 2a code (off by default, `--decode-threads N`; not yet run on a GPU):**
+  - `vidx/pipeline.py`: N decode threads (decode + sample + rotate + letterbox) feed a bounded queue. The main thread buckets frames by letterboxed shape across videos and runs a bucket when it is full or the queue runs dry. A video is emitted once its END has arrived and no frame of it waits in a bucket.
+  - `vidx/model.py`: `prepare_direct` (one predict() call, then the predictor's own AutoBackend + args), `make_letterbox` (Ultralytics LetterBox, auto=True, the predictor's stride/imgsz), `infer_tensor` (BGR→RGB, BCHW, half/float, /255, the predictor's NMS args).
+  - `run.py`: `iter_videos` / `sequential_results` / `pipeline_results`, one shared result loop (pending / 3-failed-batches / exit 3 kept).
+  - **Code review #5** (7 findings, all fixed):
+    - a letterbox setup error in a thread would hang the run → `make_prepare` moved inside try/finally, and the run raises once all threads have failed;
+    - a stale "ok" (inferred before a failed batch) cleared pending → "ok" carries `last_batch`, and only a batch newer than every failed one clears pending;
+    - an error from the shared iterator was swallowed (exit 0, videos missing) → stored and re-raised on the main thread;
+    - speedup.ipynb profile cells now pass `--sample 0`;
+    - resume without a checkpoint could mix settings → `<output>.config.json` (in commit c711611);
+    - pipeline decode time excludes time blocked on the queue (sum over threads);
+    - README documents `--decode-threads` as EXPERIMENTAL.
+  - Tests: 179 pass. Stage 1 was committed separately (c711611) and its snapshot tested alone (167 pass).
+  - **Next:** GPU check of the direct path vs predict() (FP32 bit-identical expected, FP16 >= 0.999), then a timing run with `--decode-threads 1/2` on tune, then the margin check on tune + holdout.
+- 2026-11-20: **Stage 1 gate PASSED (k=3 + FP16)**. Colab gave a **Tesla T4** after the reset (not the L4), so these speeds are not comparable with the L4 baseline.
+  - k=3 FP32 tune (pipeline vs simulator check): F1 0.9879 / exact 0.9586 / within1 0.9989 vs simulator 0.9880 / 0.9584 / 0.9988. Off by about 1–2 seconds out of 9,144, not bit-identical. Consistent with batch composition / GPU (T4 vs the L4 reference) flipping conf ~0.4 detections (batch_agreement already showed < 0.1% such frames). Not a sampling bug: the inferred frames (27,431 = 0.108) match the simulator's fraction exactly. clean=no (download running).
+  - **k=3 FP16 tune: F1 0.9877, exact 0.9586, within1 0.9989** → accepted (bar 0.985 / 0.93 / 0.985). T4: 544.9 decoded fps; decode 201 s, infer 261 s of 466 s; per image inf 7.04 ms, pre 1.52, post 0.80.
+  - **k=3 FP16 holdout: F1 0.9901, exact 0.9683, within1 0.9990** → accepted. T4: 564.5 fps (486,831 frames, 862 s).
+  - Speed on T4: brute force on the T4 is ~20 ms/frame FP32 (from the k3 fp32 row: inf 17.2 + pre 1.8 + post 1.1) ≈ 48 fps, so k=3 FP16 ≈ **11x on the same GPU**. Decode is now ~43% of the loop on the T4 runtime (few CPU cores), so Stage 2a overlap matters.
+  - **Defaults set:** `DEFAULT_SAMPLE = 3`, `DEFAULT_PRECISION = "fp16"` (README updated). Brute-force reference runs in baseline.ipynb / SETUP.md now pass `--sample 0 --precision fp32` explicitly.
+- 2026-11-20: **Code review #4 (Stage 0/1, commit 4626e7b)**, 6 findings, all fixed (164 tests pass):
+  - (important) Unbounded per-second buffer on broken timestamps → `MAX_GROUP = 240` frames per group in `vidx.sampling` (shared by simulator and pipeline; no effect on normal videos up to 240 fps).
+  - (important) The fingerprint config broke resume of older checkpoints → config is left out for the baseline (sample 0, fp32); the error message names --sample / --precision.
+  - (nit) `inferred_frames` is counted per successful batch.
+  - (nit) ProfileNoteTest moved above the main guard.
+  - (nit) `--sample < 0` and `--dump-frames` with `--sample > 0` are rejected (exit 2).
+  - (nit) The simulator docstring states that partial-failure videos are not simulated.
+- 2026-11-20: **Stage 0 profile (L4, 5 tune videos, 43,431 frames, clean):**
+  - Every frame, FP32: 99.3 fps. Per image: pre 1.58 ms (CPU letterbox), inference 7.32, post 0.67; decode 0.375 ms/frame.
+  - Every frame, **FP16: 155.3 fps** (inference 3.76 ms, 1.95x faster). FP16 alone vs reference: **F1 0.9995, exact 0.9981, within1 1.0000** (negligible loss).
+  - Decode only (`profile_decode`, 12 CPUs, FFmpeg auto threads): 5,304 fps; + BGR every frame 3,138 fps; + BGR for 5 frames/s 4,883 fps. Single thread 1,376 fps, so auto threading matters.
+  - Conclusion: even with sampling, the GPU stays the bottleneck on the L4. Model cost per inferred image ≈ 5.9 ms FP16 (of which ~1.5 ms is CPU letterbox) vs decode ≈ 0.2 ms per decoded frame.
+  - Sequential estimate per decoded frame: k=5 ≈ 1.27 ms (~4.6 h for 50 files); k=3 ≈ 0.85 ms (~3.1 h).
+  - Stage 2a (decode + letterbox in a prefetch thread, direct tensors) should give roughly another 1.5x.
+  - Bench note: `--only-common` gives PARTIAL, which bench logs as `fail_accuracy`; expected for profile runs.
+  - **Decision (by plan rule: cheapest accepted setting):** k=3 + FP16. Ladder fixed: k=3 → k=5 → every frame FP16 → every frame FP32.
+- 2026-11-20: **Sampling simulator on tune** (33 videos, 253,918 frames, 9,144 s; k=0 sanity check 1.0/1.0/1.0). Columns: inferred fraction / F1 / exact / within1:
+  - k=1 0.036 / 0.9775 / 0.9301 / 0.9913 (not accepted)
+  - k=2 0.072 / 0.9657 / 0.9190 / 0.9922 (not accepted)
+  - **k=3 0.108 (9.3x) / 0.9880 / 0.9584 / 0.9988 (accepted)**
+  - k=4 0.144 / 0.9825 / 0.9475 / 0.9968 (not accepted)
+  - **k=5 0.180 (5.6x) / 0.9911 / 0.9705 / 0.9992 (accepted)**
+  - k=6 0.216 / 0.9881 / 0.9630 / 0.9983 (accepted)
+  - k=7 0.252 (4.0x) / 0.9929 / 0.9738 / 0.9993 (accepted)
+  - k=9 0.324 / 0.9947 / 0.9776 / 0.9999 (accepted)
+  - adaptive 3:7 0.158 / 0.9929 / 0.9751 / 0.9996 (accepted)
+  - **adaptive 3:9 0.158 (6.3x) / 0.9947 / 0.9777 / 0.9999 (accepted)**
+  - adaptive 5:9 0.254 / 0.9943 / 0.9795 / 0.9998 (accepted)
+
+  Odd k clearly beats even k (vote ties / median of an even count). Every strategy passes the grader thresholds, even k=1. The weak videos are the same across strategies: people exact in videos 13, 5, 30; F1 in 15 and 20. k=3 has the thinnest F1 headroom (0.988 vs the 0.985 acceptance). Choice between k=3 and k=5 waits for the Stage 0 profile: if decode dominates after sampling, k=5 costs little extra time. Adaptive (N4) stays dropped unless fixed k fails.
+- 2026-11-20: **Stage 0 + Stage 1 code (not yet run on Colab):**
+  - `vidx/sampling.py`: `pick(n, k)` (evenly spaced centres; all frames if n <= k or k <= 0), `iter_groups` (a group closes when int(t) changes; on a decode error the buffered group is yielded, then the error re-raised = blocker B1), `sample_groups`.
+  - `vidx/decode.py`: `decode_video(data, sample=0, counter=None)` decodes and stamps every frame, converts only the sampled ones, counts decoded frames.
+  - `vidx/model.py`: `load_model(half=)` (FP16 only on CUDA); `infer` sums Ultralytics `r.speed` and predict() wall time into `model.speed`.
+  - `run.py`: `--sample K` (default `DEFAULT_SAMPLE=0`) and `--precision fp16|fp32` (default `DEFAULT_PRECISION="fp32"`); defaults change only after the tune+holdout gate. `Timers.frames` = decoded frames, plus `inferred_frames` (blocker B2). Stats JSON adds inferred_frames, sample, precision, model_speed. The checkpoint fingerprint includes sample + precision.
+  - `bench.py`: these go into the notes column (no new CSV columns).
+  - New tools: `tools/simulate_sampling.py` (offline, tune dumps + score.py, accept 0.985/0.93/0.985, k=0 sanity check must be 1.0), `tools/profile_decode.py`.
+  - Tests: 160 pass (new test_sampling, test_simulate_sampling, ProfileNoteTest).
+- 2026-11-20: **Brute-force baseline projection (Colab L4):** `bench.py extrapolate` -> projected **124,936 s (34.70 h)** for **12,981,615 frames** (all 50 files). Derived: ~9.6 ms/frame (~104 fps end-to-end); dataset averages ~28.8 fps of video (12.98 M frames / ~125 h). Unseen ~13 h test set ≈ 1.35 M frames ≈ ~3.6 h brute force on L4 (under the 6 h cap, but this is the number to beat). Still to collect: the tune row's decode_s / infer_s / aggregate_s split (decides whether decode or GPU is the bottleneck) and the checks output.
+- 2026-11-20: **Tune measured row** (bench_log.csv, clean=yes, L4): 33 videos, 253,918 frames, wall 2447.3 s, startup 2.7 s, loop 2443.7 s, 103.9 fps. CSV has no decode/infer split: it is in `/content/ref/ref_tune.jsonl.stats.json` (not collected yet).
+- 2026-11-20: **Step 11 checks:** tune schema OK (33 videos, 9,144 seconds, 0 errors); tune self-score 1.0/1.0/1.0; decoder agreement (PyAV vs cv2, 20 videos) micro F1 1.0000; batch vs single identical counts 1.0000 (max conf gap 0.00173); classes filter vs none identical. **Holdout reference is EMPTY** (check_schema: 0 videos), see issue #10. Rotation (`find_rotated`) and determinism (tune vs tune_dump) outputs were not in the paste.
+- 2026-11-20: Reference-set change (plan "Tune/holdout reference sets, clean timing, frame count and extrapolation"). Decision: the brute-force reference is now 3 parquet files spread over the dataset; **tune = train-00000** (all tuning), **holdout = train-00024 + train-00049** (scored only, never tuned on; rule added to CLAUDE.md). Brute force is not run on all 50 files (projected 25+ h): a clean timing on the tune file + a model-free frame count of all 50 files + extrapolation instead. Code: `run.py --stats-json PATH` (opt-in, written in `finally`: videos, errors, frames, decode_s, infer_s, aggregate_s, loop_s, startup_s, exit_code, argv; grader command unchanged); `score.py` multi-reference (`--ref NAME=PATH`, per-reference file set from second + error lines, candidate filtered to it, empty reference = FAIL, `--only-common` = PARTIAL, `--json`; positional form kept); new `bench.py` (`run` = timed subprocess + scoring + CSV row, clean detection via /proc download scan and nvidia-smi foreign GPU pids every 30 s; `extrapolate` = fixed + frames x per-frame from the newest clean ok row); new `tools/count_frames.py` (PyAV demux packet count, CSV, totals, `--compare-dumps`); `colab/baseline.ipynb` + `colab/SETUP.md` rewritten for the new run order. Tests: all pass (new `test_score_multi`, `test_bench`, `test_count_frames`, `StatsJsonTest` in `test_run`). Not run on Colab yet; `/code-review` pending.
+- 2026-11-19: Durable checkpoints for long Colab runs (new `vidx/checkpoint.py`, imported only when `--checkpoint-dir` / `--checkpoint-hf-repo` is given; plain `run.py --input --output` unchanged). Generation folders `gen-NNNN/` (gz output, done.txt, progress.json, manifest.json last with sizes + sha256 + run fingerprint), newest 2 kept, snapshot every `--checkpoint-minutes` (10) at a video boundary plus a final one in `finally` (SIGTERM mapped to exit); every snapshot failure only warns. `--resume` restores the newest valid generation if ahead of the local files; a fresh run over an existing checkpoint exits 2. Sidecar is now `video_id<TAB>line_count` (plain ids still read) and `_recover` redoes a video whose lines are incomplete. `--dump-frames` writes `<name>.tmp.npz` then `os.replace`. `huggingface_hub==0.29.3` pinned (provisional). Tests: `tests/test_checkpoint.py`, extended `test_output.py` / `test_run.py` (smoke test uses fake `iter_rows` + decode because `.venv` has no pyarrow). Not yet run on Colab; `/code-review` pending.
+- 2026-11-19: Housekeeping: worklog moved to `worklog/WORKLOG.md`, removed from `.gitignore`, CLAUDE.md paths and wording updated (worklog is now committed).
+- 2026-11-19: Wrote the baseline pipeline per plan: `run.py`, `prepare.py`, `score.py`, `vidx/{source,decode,model,aggregate,output}.py`, `tools/{find_rotated,decoder_agreement,batch_agreement,check_schema}.py`, `tests/` (CPU, stdlib unittest), `requirements.txt` (provisional pins), `colab/SETUP.md`, README install/prepare/run.
+- 2026-11-19: Local checks: `python -m unittest discover -s tests -v` passes (42 tests), every .py compiles.
+- 2026-11-19: Added TensorRT-deferred backend design to CLAUDE.md; first commit made (brief PDF stays out of repo).
+- 2026-11-19: Read brief. Git repo initialised in D:\video-indexing-yolo11, tracking origin/main (remote had LICENSE only). Created .gitignore, CLAUDE.md, README.md stub, ai_chats/links.txt, this WORKLOG.
+
+## Open issues
+- #2 (2026-11-19) Dev machine is Python 3.14; grader is 3.11. Pins are provisional until verified in a 3.11 venv on Colab.
+- #5 (2026-11-19) `ultralytics` depends on `opencv-python` (non-headless), which may be installed next to `opencv-python-headless` and needs `libgl1`. README/SETUP list `apt-get install libgl1 libglib2.0-0`. Revisit if the grader VM lacks apt access.
+- #6 (2026-11-19) Assumptions made while coding (review these):
+  - Parquet that cannot be opened -> one error line `<file>:0`. A file that opens but has an unreadable row group -> one error line per remaining row of that group (row counts come from the footer).
+  - Error text format: `could not decode video: <ExceptionType: message>` (truncated to 200 chars); zero decoded frames without an exception -> `no frames decoded`.
+  - `--limit-videos N` counts the first N videos in sorted file/row order, including ones skipped by `--resume`.
+  - The inference batch size is the whole `predict()` list; relies on Ultralytics treating a list of ndarrays as one batch.
+  - `prepare.py` downloads with `ultralytics.utils.downloads.attempt_download_asset(<abs path>)`, falling back to `YOLO("yolo11l.pt")` in the repo dir. Untested.
+  - Offline settings: `YOLO_OFFLINE=1`, `settings.update(sync=False)`, `YOLO_CONFIG_DIR` in the temp dir (set with `setdefault`). Untested; confirm with the offline check.
+  - `io.BytesIO(memoryview(buffer))` copies the mp4 bytes once per video (cheap relative to decode); `as_buffer()` itself does not copy.
+  - Stream-level rotation side data via `stream.side_data["DISPLAYMATRIX"]` is a guess about the PyAV API; it is wrapped in try/except and only a fallback after `frame.rotation`.
+  - `--resume` fsync is not done (flush only); a VM crash could lose the last video, which is simply redone because the sidecar is written after the output.
+- #4 (2026-11-19) RESOLVED: worklog is now committed in `worklog/`.
+- #7 (2026-11-19) Checkpoint assumptions (review, untested on Colab / the real HF Hub):
+  - `huggingface_hub==0.29.3` is believed to have `HfApi.upload_folder`, `delete_folder`, `list_repo_files`, `hf_hub_download(local_dir=)`; only a fake API object was tested. The repo must exist already (not auto-created).
+  - `--checkpoint-dir` stores under `DIR/<run-name>/gen-NNNN` (the plan said straight into DIR) so `--run-name` and the fresh-run guard work for folders too.
+  - HF `--dump-frames` files go to `<run-name>/frames/` in the same commit as the generation (never pruned), so old generations can be deleted without losing frames. Dump files are not restored automatically.
+  - Restore compares done-video counts: local wins ties; local counts only if output and sidecar both exist. A restore error (network, corrupt store) exits 2 rather than silently starting over.
+  - A checkpoint with a different fingerprint (input path, `--limit-videos`, output name, run name; superseded input-size rule: see Code review #2) is refused (exit 2) even if older than local files.
+  - The final snapshot always makes a new generation, even if nothing changed. Time lost after a crashed session's last snapshot is not in `compute_s`.
+  - A half-written dump is only protected from partial reads, not cleaned up at start; `*.tmp.npz` files are ignored by the HF uploader.
+  - SIGTERM handler is `sys.exit(143)`, installed only with a checkpoint flag. Windows `.venv` runs Python 3.14, so the tests have not run on 3.11.
+
+- #8 (2026-11-20) Colab step 11 "Checks" ran > 30 min. Likely cause (unverified): `tools/decoder_agreement.py --n 20` runs YOLO on **every frame of 20 whole videos twice** (PyAV and cv2), i.e. roughly a brute-force run on ~40 video-passes; `batch_agreement` (1000 frames × 3 passes) is small. Also a `%%bash` cell shows output only when it ends, so progress is invisible. To do: confirm with `ps`/`nvidia-smi`, cap decoder_agreement to N seconds or frames per video, run each check in its own cell / with progress output.
+- #9 (2026-11-20) Colab facts learned: Colab kernel Python is 3.13 (venv is uv-managed 3.11.18); notebook kernel exports `MPLBACKEND=module://matplotlib_inline...` which breaks Ultralytics in subprocesses (fixed in `vidx/__init__.py`); repeated `hf download --include` flags appeared to keep only the last pattern (fixed: one `--include` with 3 patterns; cause not verified with `ls`). requirements.txt pins installed cleanly on py3.11 (54 packages, torch 2.6.0+cu126) — pins verified for install; runtime not yet verified.
+
+- #10 (2026-11-20) `ref_holdout.jsonl` had 0 videos when step 11 ran. Step 10 starts the holdout run with `nohup ... &`, so the likely cause (unverified) is that it was still running or had crashed when the checks started. If it was still running, it shared the GPU with decoder_agreement, which may also explain #8. To do: `tail /content/holdout.log`, `nvidia-smi`, `wc -l /content/ref/ref_holdout.jsonl`; once it is complete, rerun the holdout schema and self-score checks. Notebook fix to consider: a wait/assert cell before step 11.
+  - Update 2026-11-20: a later cell found `/content/holdout.log`, `/content/ref/*`, `/content/subset/holdout` and `ref_tune.jsonl.stats.json` all missing, and no GPU processes. So the **Colab runtime had been reset** (/content wiped), which means the holdout log is lost. When step 11 ran, the holdout file existed but was empty (check_schema opens it without a guard). That fits a run that had just started or failed early. Evidence still available: the `$DRIVE/ckpt/ref_holdout` checkpoint and `$DRIVE/reference`. Also lost: the tune decode/infer split. Notebook gap: stats.json and the logs are not copied to Drive.
+  - Update 2026-11-20 (Drive listing): the holdout run **completed**. Final checkpoint `ckpt/ref_holdout/gen-0014` (00:48 UTC): 66 videos, 486,831 frames, 0 errors, decode 180 s, infer 9,617 s, aggregate 0.6 s. But `$DRIVE/reference/ref_holdout.jsonl` was copied at 00:24, **before the run ended**, so it is a partial file. Fix: restore from `gen-0014/results.jsonl.gz`, then check schema and self-score (expect 66 videos). The holdout run started 22:05, so it shared the GPU with the tune dump run and the checks. Its timing (~51 fps) is therefore not clean, but the split is still telling: **inference is ~98% of the time, decode ~2%**, so the GPU is the bottleneck.
+  - **RESOLVED 2026-11-20:** holdout restored from `gen-0014`: 17,586 lines (the partial Drive copy had 11,568), schema OK with 66 videos and 0 errors, self-score 1.0/1.0/1.0. Determinism: tune vs tune_dump scores 1.0/1.0/1.0 over 9,144 seconds. Drive copy `$DRIVE/reference/ref_holdout.jsonl` overwritten with the restored file (17,586 lines, confirmed). **Baseline complete** (rotation check output still not seen).
+
+## Deferred
+- #3 (2026-11-19) **Deferred, design noted.** TensorRT: L4 dev vs RTX 4090 grader, engine must be built in grader prep step. Rules recorded in CLAUDE.md "Inference backend". Baseline first with PyTorch .pt; model behind load_model()/infer(batch).
+
+## Closed issues
+- 2026-11-19 **Code review #1** (10 findings, all closed; 55 tests pass):
+  - R1 Inference failures were handled like decode failures. Fix: `run_inference` splits a batch in halves on CUDA OOM; other model errors raise `InferenceError`, the video is not written or marked done, and 3 in a row abort the run (exit 3, retry with `--resume`).
+  - R2 `YOLO_OFFLINE` was set to "1". Fix: now "True" (Ultralytics compares `value.lower() == "true"`).
+  - R3 A `--dump-frames` failure discarded the video's lines. Fix: the dump has its own try/except and only logs a warning.
+  - R4 `opencv-python-headless` clashed with the `opencv-python` that ultralytics pulls in. Fix: pinned `opencv-python==4.10.0.84` (numpy<2 compatible); SETUP.md wording updated. Still PROVISIONAL until verified (also supersedes #5's duplicate-wheel concern).
+  - R5 Leading frames without pts then a pts reset time to 0. Fix: `first_pts` is anchored so the first pts frame continues the estimated timeline.
+  - R6 No-rate fallback used absolute index/30. Fix: `last_t + step` (1/rate, else median of previous positive gaps, else 1/30; first frame 0).
+  - R7 `--resume` with an output but no `.done` sidecar silently wiped the output. Fix: `ResumeError` with a clear message (main exits 2).
+  - R8 All frame details were kept in memory. Fix: `process_frames(..., keep_details=)`; full records only with `--dump-frames`.
+  - R9 Two GPU transfers per result in `infer`. Fix: one `boxes.data.cpu()`, conf = column 4, cls = column 5.
+  - R10 `tools/batch_agreement.py` re-implemented batching. Fix: it calls `run.process_frames` with batch 1 vs `--batch`, plus a `classes=None` wrapper.
+- 2026-11-19 **Code review #2 (checkpoints)** (10 findings closed; 95 tests pass):
+  - C1 Fingerprint covered every parquet, so a changed download set blocked resume. Fix: fingerprint = resolved input path + `--limit-videos` + output name + run name; the manifest records name+size of each parquet that had a video processed, and resume refuses only if one of those is missing or changed size (new files are fine).
+  - C2 One `InferenceError` video was silently dropped with exit 0. Fix: failed ids wait in a pending list; the next successful video first writes them as `inference failed: ...` error lines (marked done); 3 in a row abort with exit 3 without writing them (`--resume` retries); leftovers at the normal end are written as error lines.
+  - C3 A store listing failure counted as "no checkpoint". Fix: `Checkpointer.startup()` lists every store once and raises `CheckpointError` (exit 2) if any fails, for fresh and resume runs alike.
+  - C4 `restore()` died on one bad generation. Fix: fetch/validate errors per generation are logged and the next older generation / other store is tried.
+  - C5 A missing Drive mount would be recreated as a local folder. Fix: `DirStore` requires the checkpoint dir's parent to exist ("checkpoint dir parent missing — is Google Drive mounted?"), at listing and at publish; only the dir and `<run-name>` are ever created.
+  - C6 One generation number for all stores, and a prune error counted as a failed publish. Fix: number computed per store inside its own try/except; prune failure only warns, the publish still counts and dump frames are marked sent.
+  - C7 A sidecar entry with no output lines (legacy, or count 0) counted as done. Fix: done needs >= 1 complete line (exactly the recorded count if known); `write_video` refuses an empty list, so a count of 0 is never written.
+  - C8 `huggingface_hub==0.29.3` has no `hf` CLI. Fix: pinned `huggingface_hub==0.34.4` (still PROVISIONAL, unverified on Colab; `HfApi` methods used by `HFStore` are only tested against a fake).
+  - C9 `prune()` kept the newest 2 numbers even if invalid. Fix: `prune_store` keeps the newest 2 valid generations (manifest + sizes; HF: manifest present in the listing) and deletes invalid/partial and older ones.
+  - C10 (**partial**) Re-listing stores every snapshot and re-reading files for sha256. Fix: generation numbers are listed once at startup and kept in memory per store; size and sha256 are computed while writing. Deliberately NOT done: background upload thread.
+- #1 (2026-11-19) The worklog used to be private; it is now committed in `worklog/`, so chat logs and the repo agree.
+- #4 (2026-11-19) Decision made: commit the worklog in `worklog/`.
+
+## Session log
+- 2026-11-20 (long session, Opus): baseline finished → plan + review → Stage 0/1/2a implemented, reviewed (#4–#6) and validated → full 50-file run (1 h 52 min, 18.6x) → deliverables committed and tagged.
+- 2026-11-19: Session "Alethia": repo setup.
+- 2026-11-19: Execution session (Sonnet): housekeeping + local code per the approved plan (steps 1-2). Colab steps not started.
+- 2026-11-20: Code review #3 (bench/score/count_frames), fixes:
+  - bench: a scoring exception no longer prevents the CSV row (row logged with blank scores and the error, truncated, in notes; exit 1).
+  - bench: GPU-busy detection now scans `/proc/<pid>/fd` for open `/dev/nvidia*` fds outside bench's own process tree (reason `other GPU process pid=.. cmd=..`); no /proc -> clean "no", unknown. The nvidia-smi compute-apps check is gone (nvidia-smi is only used for the GPU name). The process tree is computed once per check and passed to both scanners.
+  - bench: a failed or PARTIAL `--ref` set gives status `fail_accuracy` and a non-zero exit (`failed` stays for a non-zero run.py exit); `extrapolate` only uses `status=ok` rows.
+  - colab notebook + SETUP.md: reset instructions now also say to re-download the 3 reference files, recreate the symlinks and restart the 50-file download if unfinished; the symlink cell uses `shopt -s failglob` plus an existence check so an unmatched glob fails loudly.
+  - tools/count_frames.py: per-file error handling (an error row per failing file, also for metadata access), BrokenProcessPool retries the unfinished files serially, the CSV is always written, error count printed.
+  - run.py: the SIGTERM->SystemExit handler is installed when `--stats-json` or a checkpoint flag is set (never for the plain grader command).
+  - score.py: the two-file positional mode no longer filters the candidate (extra candidate seconds are FP again); filtering stays in `--ref` mode with a loud WARNING for ignored candidate videos and an explicit message when the candidate shares no parquet file with a reference. `--only-common` with no overlapping videos reports "no overlapping videos between candidate and reference" (FAIL, not empty_reference).
+  - shared helpers: `vidx.source.list_inputs` (used by run.py and count_frames) and public `vidx.source.short_error` (was `_short`).
+  - tests added/adjusted in test_bench, test_score_multi, test_count_frames, test_run.

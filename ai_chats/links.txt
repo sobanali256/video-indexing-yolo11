@@ -1,2 +1,5 @@
-# Share links for web AI chats (ChatGPT / Claude.ai / Gemini) used for this task, one per line.
-# Claude Code session logs (.jsonl) are copied into this folder unedited (tokens replaced with [REMOVED]).
+# No web AI chats (ChatGPT / Claude.ai / Gemini) were used for this task, so there are no share links.
+# All AI work was done in Claude Code. Its session logs are in this folder, unedited apart from tokens replaced
+# with [REMOVED]:
+#   6cf43f45-69ec-40fd-b1fe-450d1e37f61a.jsonl (+ folder: subagents/, tool-results/)
+#   c229ec4a-729e-4348-868c-2eb8898847f3.jsonl (+ folder: subagents/, tool-results/)

@@ -1,0 +1,908 @@
+ bench.py                                 |  24 +++++
+ run.py                                   |  57 ++++++++--
+ tests/test_bench.py                      |  14 +++
+ tests/test_run.py                        |  17 +--
+ tests/test_sampling.py                   |  84 +++++++++++++++
+ tests/test_simulate_sampling.py          |  75 +++++++++++++
+ tools/profile_decode.py                  |  88 +++++++++++++++
+ tools/simulate_sampling.py               | 156 +++++++++++++++++++++++++++
+ vidx/checkpoint.py                       |   9 +-
+ vidx/decode.py                           |  23 +++-
+ vidx/model.py                            |  23 +++-
+ vidx/sampling.py                         |  60 +++++++++++
+ worklog/WORKLOG.md                       |  10 +-
+ worklog/plans/2026-11-20-speedup-plan.md | 180 +++++++++++++++++++++++++++++++
+ 14 files changed, 794 insertions(+), 26 deletions(-)
+diff --git a/bench.py b/bench.py
+index 3315c3a..95e1059 100644
+--- a/bench.py
++++ b/bench.py
+@@ -248,6 +248,27 @@ def load_stats(path):
+ 
+ # ---------------------------------------------------------------- run
+ 
++def profile_note(stats):
++    """Short summary of the run settings and the stage-0 profile for the CSV notes column (no new columns,
++    so existing bench_log.csv files stay readable). Empty if the stats file has none of it."""
++    parts = []
++    if stats.get("inferred_frames") is not None:
++        parts.append(f"inferred={stats['inferred_frames']}")
++    for key in ("sample", "precision"):
++        if stats.get(key) is not None:
++            parts.append(f"{key}={stats[key]}")
++    if stats.get("decode_s") is not None and stats.get("infer_s") is not None:
++        parts.append(f"decode_s={stats['decode_s']:.1f} infer_s={stats['infer_s']:.1f}")
++    sp = stats.get("model_speed") or {}
++    n = sp.get("images") or 0
++    if n:
++        per = {k: sp.get(k, 0.0) / n for k in ("preprocess_ms", "inference_ms", "postprocess_ms")}
++        overhead_ms = (sp.get("predict_wall_s", 0.0) * 1000 - sum(sp.get(k, 0.0) for k in per)) / n
++        parts.append("ms/img pre={:.2f} inf={:.2f} post={:.2f} other={:.2f}".format(
++            per["preprocess_ms"], per["inference_ms"], per["postprocess_ms"], overhead_ms))
++    return "; ".join(parts)
++
++
+ def run_bench(args, extra, proc_scan=None, gpu_scan=None, gpu_name_fn=None, tree_fn=None):
+     out = Path(args.out)
+     out.parent.mkdir(parents=True, exist_ok=True)
+@@ -280,6 +301,9 @@ def run_bench(args, extra, proc_scan=None, gpu_scan=None, gpu_name_fn=None, tree
+         "wall_s": fmt(wall), "startup_s": fmt(stats.get("startup_s")), "loop_s": fmt(loop_s),
+         "fps_loop": fmt(fps, 2), "notes": args.notes or "", "command": shlex.join(cmd),
+     }
++    prof = profile_note(stats)
++    if prof:
++        row["notes"] = (row["notes"] + " " + prof).strip()
+     exit_code = rc
+     if rc != 0:
+         row["notes"] = (row["notes"] + f" run.py exit code {rc}").strip()
+diff --git a/run.py b/run.py
+index 82f50b2..91ce904 100644
+--- a/run.py
++++ b/run.py
+@@ -20,6 +20,10 @@ from vidx.aggregate import aggregate, error_line, make_lines
+ _PROCESS_START = time.perf_counter()  # approximates process start: startup_s = imports + CUDA init + model load
+ log = logging.getLogger("run")
+ MAX_INFERENCE_FAILURES = 3
++# Defaults of the grader command (`run.py --input --output`). They change only after a setting passed the
++# accuracy margin on tune AND holdout; the commit that produced results.jsonl.gz is tagged with them.
++DEFAULT_SAMPLE = 0  # frames per second sent to the model; 0 = every frame (brute force)
++DEFAULT_PRECISION = "fp32"
+ 
+ 
+ class Record(NamedTuple):
+@@ -36,14 +40,24 @@ class InferenceError(Exception):
+ 
+ 
+ class Timers:
++    """frames = frames decoded (the unit of speed and extrapolation); inferred_frames = frames sent to
++    the model. Without sampling both are equal. Fakes that bypass the decoder count inferred frames as
++    decoded (see process_frames)."""
++
+     def __init__(self):
+         self.decode = self.infer = self.aggregate = 0.0
+-        self.frames = self.videos = self.errors = 0
++        self.videos = self.errors = 0
++        self.decoded_frames = self.inferred_frames = 0
++
++    @property
++    def frames(self):
++        return self.decoded_frames
+ 
+     def summary(self, total):
+         fps = self.frames / total if total > 0 else 0.0
+         return (
+-            f"videos {self.videos} (errors {self.errors}), frames {self.frames} | "
++            f"videos {self.videos} (errors {self.errors}), frames {self.frames} "
++            f"(inferred {self.inferred_frames}) | "
+             f"decode {self.decode:.1f}s, infer {self.infer:.1f}s, aggregate {self.aggregate:.1f}s, "
+             f"total {total:.1f}s | {fps:.1f} frames/s overall"
+         )
+@@ -123,10 +137,24 @@ def process_frames(frames, infer_fn, batch_size, timers, keep_details=False):
+         if len(pending) >= batch_size:
+             flush()
+     flush()  # frames decoded before a decode error are still valid
+-    timers.frames += len(records)
++    timers.inferred_frames += len(records)
++    if not getattr(frames, "counts_decoded", False):  # plain iterators (tests, tools): decoded == inferred
++        timers.decoded_frames += len(records)
+     return records, error
+ 
+ 
++class CountedFrames:
++    """Wraps a decode generator that increments timers.decoded_frames itself (see process_frames)."""
++
++    counts_decoded = True
++
++    def __init__(self, gen):
++        self.gen = gen
++
++    def __iter__(self):
++        return self.gen
++
++
+ def video_lines(video_id, records, error):
+     """Records (+ optional error) -> output lines. Partial last second is kept."""
+     lines = []
+@@ -174,7 +202,8 @@ def process_video(video_id, data, infer_fn, args, timers):
+ 
+     try:
+         records, error = process_frames(
+-            decode_video(data), infer_fn, args.batch, timers, keep_details=bool(args.dump_frames)
++            CountedFrames(decode_video(data, sample=args.sample, counter=timers)),
++            infer_fn, args.batch, timers, keep_details=bool(args.dump_frames),
+         )
+         t0 = time.perf_counter()
+         lines = video_lines(video_id, records, error)
+@@ -196,6 +225,10 @@ def parse_args(argv=None):
+     ap.add_argument("--input", required=True, help="folder of .parquet files (or one file)")
+     ap.add_argument("--output", required=True, help="results.jsonl")
+     ap.add_argument("--batch", type=int, default=32, help="inference batch size (default 32)")
++    ap.add_argument("--sample", type=int, default=DEFAULT_SAMPLE, metavar="K",
++                    help=f"frames per second sent to the model, evenly spaced; 0 = every frame (default {DEFAULT_SAMPLE})")
++    ap.add_argument("--precision", choices=["fp16", "fp32"], default=DEFAULT_PRECISION,
++                    help=f"model precision on the GPU (default {DEFAULT_PRECISION})")
+     ap.add_argument("--resume", action="store_true", help="continue a previous run (uses <output>.done)")
+     ap.add_argument("--limit-videos", type=int, default=None, help="only the first N videos")
+     ap.add_argument("--dump-frames", default=None, metavar="DIR", help="save per-frame npz per video")
+@@ -220,7 +253,8 @@ def setup_checkpoint(args, files):
+         stores.append(checkpoint.DirStore(args.checkpoint_dir, run_name))
+     if args.checkpoint_hf_repo:
+         stores.append(checkpoint.HFStore(args.checkpoint_hf_repo, run_name))
+-    fp = checkpoint.make_fingerprint(Path(args.input).resolve(), args.limit_videos, args.output, run_name)
++    fp = checkpoint.make_fingerprint(Path(args.input).resolve(), args.limit_videos, args.output, run_name,
++                                     config={"sample": args.sample, "precision": args.precision})
+     ckpt = checkpoint.Checkpointer(
+         stores, args.output, fp, args.checkpoint_minutes, args.dump_frames,
+         inputs={f.name: f.stat().st_size for f in files},
+@@ -240,12 +274,16 @@ def write_stats(path, stats, timers, exit_code, argv):
+         d = {
+             "videos": timers.videos if timers else 0,
+             "errors": timers.errors if timers else 0,
+-            "frames": timers.frames if timers else 0,
++            "frames": timers.frames if timers else 0,  # decoded frames
++            "inferred_frames": timers.inferred_frames if timers else 0,
+             "decode_s": timers.decode if timers else 0.0,
+             "infer_s": timers.infer if timers else 0.0,
+             "aggregate_s": timers.aggregate if timers else 0.0,
+             "loop_s": stats.get("loop_s"),  # loop start -> loop end; None if the loop never started
+             "startup_s": stats.get("startup_s"),
++            "sample": stats.get("sample"),
++            "precision": stats.get("precision"),
++            "model_speed": stats.get("model_speed"),
+             "exit_code": exit_code,
+             "argv": list(argv),
+         }
+@@ -294,11 +332,14 @@ def _main(args, stats):
+         # run `finally` (stats / checkpoint) on SIGTERM; never for the plain grader command
+         signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
+     try:
+-        model = load_model()
++        model = load_model(half=args.precision == "fp16")
+     except FileNotFoundError as e:
+         print(str(e), file=sys.stderr)
+         return 2
+-    log.info("model loaded on %s", model.device)
++    log.info("model loaded on %s (%s, sample %s)", model.device, "fp16" if model.half else "fp32", args.sample)
++    stats["sample"] = args.sample
++    stats["precision"] = "fp16" if model.half else "fp32"
++    stats["model_speed"] = model.speed  # filled in place by infer()
+ 
+     def infer_fn(images):
+         return infer(model, images)
+diff --git a/tests/test_bench.py b/tests/test_bench.py
+index 79c2d10..4dc6964 100644
+--- a/tests/test_bench.py
++++ b/tests/test_bench.py
+@@ -298,3 +298,17 @@ class ExtrapolateTest(unittest.TestCase):
+ 
+ if __name__ == "__main__":
+     unittest.main()
++
++
++class ProfileNoteTest(unittest.TestCase):
++    def test_empty_and_full(self):
++        self.assertEqual(bench.profile_note({}), "")
++        note = bench.profile_note({
++            "inferred_frames": 50, "sample": 5, "precision": "fp16", "decode_s": 2.0, "infer_s": 10.0,
++            "model_speed": {"preprocess_ms": 100.0, "inference_ms": 300.0, "postprocess_ms": 50.0,
++                            "predict_wall_s": 0.5, "predict_calls": 2, "images": 50},
++        })
++        self.assertIn("inferred=50", note)
++        self.assertIn("sample=5", note)
++        self.assertIn("precision=fp16", note)
++        self.assertIn("pre=2.00 inf=6.00 post=1.00 other=1.00", note)  # (500 - 450) ms / 50 images
+diff --git a/tests/test_run.py b/tests/test_run.py
+index 0e31368..dc8853e 100644
+--- a/tests/test_run.py
++++ b/tests/test_run.py
+@@ -117,14 +117,16 @@ class ProcessFramesTest(unittest.TestCase):
+ 
+ 
+ def make_args(**kw):
+-    return SimpleNamespace(**{"batch": 4, "dump_frames": None, **kw})
++    return SimpleNamespace(**{"batch": 4, "dump_frames": None, "sample": 0, **kw})
+ 
+ 
+ def fake_decode(n=3, fail_after=None):
+-    def decode(data):
++    def decode(data, sample=0, counter=None):
+         for i in range(n):
+             if fail_after == i:
+                 raise ValueError("corrupt packet")
++            if counter is not None:
++                counter.decoded_frames += 1
+             yield frame(F(i, 2), person=1)
+     return decode
+ 
+@@ -182,7 +184,7 @@ class MainAbortTest(unittest.TestCase):
+             raise RuntimeError("driver broke")
+ 
+         vidx.decode.decode_video = fake_decode()
+-        vidx.model.load_model = lambda: SimpleNamespace(device="cpu")
++        vidx.model.load_model = lambda **kw: SimpleNamespace(device="cpu", half=False, speed={})
+         vidx.model.infer = bad_infer
+         vidx.source.iter_rows = lambda path: ((f"p:{i}", b"", None) for i in range(10))
+         try:
+@@ -197,10 +199,12 @@ class MainAbortTest(unittest.TestCase):
+             (vidx.decode.decode_video, vidx.model.load_model, vidx.model.infer, vidx.source.iter_rows) = saved
+ 
+ 
+-def fake_decode_by_data(data):
++def fake_decode_by_data(data, sample=0, counter=None):
+     """Deterministic fake video: data is the video id as bytes; person count depends on it."""
+     n = 2 + len(data) % 3
+     for i in range(n):
++        if counter is not None:
++            counter.decoded_frames += 1
+         yield frame(F(i, 2), person=(len(data) + i) % 4)
+ 
+ 
+@@ -231,7 +235,7 @@ class FakeRun:
+         self.mods = (vidx.decode, vidx.model, vidx.source)
+         self.saved = (vidx.decode.decode_video, vidx.model.load_model, vidx.model.infer, vidx.source.iter_rows)
+         vidx.decode.decode_video = fake_decode_by_data
+-        vidx.model.load_model = lambda: SimpleNamespace(device="cpu")
++        vidx.model.load_model = lambda **kw: SimpleNamespace(device="cpu", half=False, speed={})
+         vidx.model.infer = self.infer
+         vidx.source.iter_rows = self.rows
+         return self
+@@ -380,7 +384,8 @@ class CheckpointMainTest(unittest.TestCase):
+ 
+ 
+ class StatsJsonTest(unittest.TestCase):
+-    KEYS = {"videos", "errors", "frames", "decode_s", "infer_s", "aggregate_s", "loop_s", "startup_s",
++    KEYS = {"videos", "errors", "frames", "inferred_frames", "decode_s", "infer_s", "aggregate_s", "loop_s", "startup_s",
++            "sample", "precision", "model_speed",
+             "exit_code", "argv"}
+ 
+     def stats(self, fr, name="s.json"):
+diff --git a/tests/test_sampling.py b/tests/test_sampling.py
+new file mode 100644
+index 0000000..2698dec
+--- /dev/null
++++ b/tests/test_sampling.py
+@@ -0,0 +1,84 @@
++import os
++import sys
++import unittest
++from fractions import Fraction as F
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++from vidx.sampling import pick, sample_groups  # noqa: E402
++
++
++class PickTest(unittest.TestCase):
++    def test_off_or_small_group_keeps_all(self):
++        self.assertEqual(pick(30, 0), list(range(30)))
++        self.assertEqual(pick(3, 5), [0, 1, 2])  # n < k
++        self.assertEqual(pick(5, 5), [0, 1, 2, 3, 4])  # n == k
++        self.assertEqual(pick(0, 5), [])
++
++    def test_evenly_spaced_centres(self):
++        self.assertEqual(pick(30, 3), [5, 15, 25])
++        self.assertEqual(pick(30, 5), [3, 9, 15, 21, 27])
++        self.assertEqual(pick(10, 1), [5])
++
++    def test_strictly_increasing_in_range(self):
++        for n in range(1, 130):
++            for k in range(1, 12):
++                idx = pick(n, k)
++                self.assertEqual(len(idx), min(n, k))
++                self.assertEqual(idx, sorted(set(idx)))
++                self.assertTrue(all(0 <= i < n for i in idx))
++
++
++def ts(*pairs):
++    """[(t, tag)] items."""
++    return [(F(t), tag) for t, tag in pairs]
++
++
++class SampleGroupsTest(unittest.TestCase):
++    def run_sg(self, items, k):
++        return [tag for _, tag in sample_groups(iter(items), lambda x: x[0], k)]
++
++    def test_one_frame_per_second_minimum(self):
++        items = [(F(i, 10), i) for i in range(30)]  # 3 seconds of 10 frames
++        self.assertEqual(self.run_sg(items, 1), [5, 15, 25])
++
++    def test_k_zero_keeps_everything(self):
++        items = [(F(i, 10), i) for i in range(25)]
++        self.assertEqual(self.run_sg(items, 0), list(range(25)))
++
++    def test_short_last_second_kept(self):
++        items = [(F(i, 10), i) for i in range(12)]  # second 1 has 2 frames, k=5 -> both
++        self.assertEqual(self.run_sg(items, 5), [1, 3, 5, 7, 9, 10, 11])
++
++    def test_every_second_with_frames_keeps_a_frame(self):
++        items = ts((0, "a"), (F(5, 2), "b"), (7, "c"))  # seconds 0, 2, 7 (gaps)
++        self.assertEqual(self.run_sg(items, 3), ["a", "b", "c"])
++
++    def test_backwards_timestamp_starts_new_group(self):
++        items = [(F(0), 0), (F(1, 2), 1), (F(3, 2), 2), (F(9, 10), 3), (F(2), 4)]
++        # groups: [0,1] (s0), [2] (s1), [3] (s0 again), [4] (s2); k=1 picks one from each group
++        self.assertEqual(self.run_sg(items, 1), [1, 2, 3, 4])
++
++    def test_failure_mid_second_yields_buffered_group_then_raises(self):
++        def gen():
++            for i in range(14):  # second 0 complete, second 1 has 4 frames
++                yield (F(i, 10), i)
++            raise ValueError("corrupt packet")
++
++        got = []
++        with self.assertRaises(ValueError):
++            for _, tag in sample_groups(gen(), lambda x: x[0], 3):
++                got.append(tag)
++        self.assertEqual(got, [1, 5, 8, 10, 12, 13])  # partial second 1 sampled before the error
++
++    def test_failure_before_any_frame(self):
++        def gen():
++            raise ValueError("moov atom not found")
++            yield
++
++        with self.assertRaises(ValueError):
++            list(sample_groups(gen(), lambda x: x[0], 3))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_simulate_sampling.py b/tests/test_simulate_sampling.py
+new file mode 100644
+index 0000000..1457983
+--- /dev/null
++++ b/tests/test_simulate_sampling.py
+@@ -0,0 +1,75 @@
++import io
++import json
++import os
++import sys
++import tempfile
++import unittest
++from contextlib import redirect_stdout
++from fractions import Fraction as F
++from pathlib import Path
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++try:
++    import numpy  # noqa: F401
++except ImportError:  # pragma: no cover
++    numpy = None
++
++import run  # noqa: E402
++from tools import simulate_sampling as sim  # noqa: E402
++from vidx.aggregate import aggregate, make_lines  # noqa: E402
++
++
++def records(n_frames, fps, person_fn):
++    return [run.Record(F(i, fps), [person_fn(i), 0, 0, 0, 0], [0.9, 0, 0, 0, 0], i, 0, (4, 6, 3))
++            for i in range(n_frames)]
++
++
++@unittest.skipIf(numpy is None, "numpy not installed")
++class SimulateTest(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.root = Path(self.tmp.name)
++        self.dumps = self.root / "frames"
++        vids = {
++            "f.parquet:0": records(90, 30, lambda i: 1),  # steady: any k is exact
++            "f.parquet:1": records(60, 30, lambda i: 2 if i % 2 else 1),  # flickers every frame
++        }
++        lines = []
++        for vid, recs in vids.items():
++            run.dump_frames(self.dumps, vid, recs)
++            lines += make_lines(vid, aggregate((r.t, r.counts) for r in recs))
++        lines.append({"video": "f.parquet:2", "error": "could not decode video: x"})
++        self.ref = self.root / "ref.jsonl"
++        self.ref.write_text("".join(json.dumps(l) + "\n" for l in lines), encoding="utf-8")
++
++    def tearDown(self):
++        self.tmp.cleanup()
++
++    def test_video_id_roundtrip(self):
++        _, final = run.npz_paths(self.dumps, "train-00000-of-01357.parquet:12")
++        self.assertEqual(sim.video_id_of(final), "train-00000-of-01357.parquet:12")
++
++    def test_every_frame_reproduces_reference_and_k_reduces_frames(self):
++        out = io.StringIO()
++        with redirect_stdout(out):
++            rc = sim.main(["--dumps", str(self.dumps), "--ref", str(self.ref), "--k", "1,3",
++                           "--adaptive", "1:5", "--json", str(self.root / "r.json")])
++        self.assertEqual(rc, 0, out.getvalue())
++        res = json.loads((self.root / "r.json").read_text(encoding="utf-8"))
++        base, k1, k3, ad = res
++        self.assertEqual((base["f1"], base["exact"], base["within1"]), (1.0, 1.0, 1.0))
++        self.assertEqual(base["inferred"], 150)
++        self.assertEqual(k1["inferred"], 5)  # one frame per second, 5 seconds
++        self.assertEqual(k3["inferred"], 15)
++        self.assertEqual(ad["inferred"], 5)  # k0=1: nothing to disagree with -> no refinement
++
++    def test_disagree(self):
++        self.assertFalse(sim.disagree([(1, 0, 0, 0, 0), (1, 0, 0, 0, 0)]))
++        self.assertTrue(sim.disagree([(1, 0, 0, 0, 0), (2, 0, 0, 0, 0)]))
++        self.assertTrue(sim.disagree([(1, 0, 0, 0, 0), (1, 1, 0, 0, 0)]))
++        self.assertFalse(sim.disagree([(1, 2, 0, 0, 0), (1, 1, 0, 0, 0)]))  # same presence, same people
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tools/profile_decode.py b/tools/profile_decode.py
+new file mode 100644
+index 0000000..b6fabb4
+--- /dev/null
++++ b/tools/profile_decode.py
+@@ -0,0 +1,88 @@
++"""Stage-0 decode profile (CPU only, no model): how fast can one process decode, and what does BGR
++conversion cost? Decides whether decoding needs threads or worker processes once sampling cuts model work.
++
++    python tools/profile_decode.py --input /content/subset/tune --videos 5
++
++Modes per FFmpeg thread count (0 = FFmpeg's automatic choice):
++  decode   decode + timestamp only (lower bound: work that sampling cannot skip)
++  bgr_all  decode + BGR conversion of every frame (what brute force does)
++  sample5  decode + BGR conversion of 5 frames per second (vidx.decode with sample=5)
++"""
++import argparse
++import os
++import sys
++import time
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
++
++from vidx.decode import Timestamper, _open, pick_video_stream  # noqa: E402
++from vidx.sampling import sample_groups  # noqa: E402
++from vidx.source import iter_rows, list_inputs  # noqa: E402
++
++
++def run_mode(data, mode, threads):
++    """-> (decoded frames, converted frames, seconds)."""
++    t0 = time.perf_counter()
++    container = _open(data)
++    decoded = converted = 0
++    try:
++        stream = pick_video_stream(container)
++        if stream is None:
++            return 0, 0, 0.0
++        stream.thread_type = "AUTO"
++        if threads:
++            stream.thread_count = threads
++        stamper = Timestamper(stream.time_base, stream.guessed_rate or stream.average_rate)
++
++        def stamped():
++            nonlocal decoded
++            for frame in container.decode(stream):
++                decoded += 1
++                yield frame, stamper.stamp(frame.pts)
++
++        frames = stamped()
++        if mode == "sample5":
++            frames = sample_groups(frames, lambda x: x[1], 5)
++        for frame, _ in frames:
++            if mode != "decode":
++                frame.to_ndarray(format="bgr24")
++                converted += 1
++    finally:
++        container.close()
++    return decoded, converted, time.perf_counter() - t0
++
++
++def main(argv=None):
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("--input", required=True)
++    ap.add_argument("--videos", type=int, default=5)
++    ap.add_argument("--threads", default="0,1,2,4", help="FFmpeg thread counts to try (0 = auto)")
++    ap.add_argument("--modes", default="decode,bgr_all,sample5")
++    args = ap.parse_args(argv)
++
++    datas = []
++    for path in list_inputs(args.input):
++        for vid, data, err in iter_rows(path):
++            if not err and data is not None:
++                datas.append((vid, bytes(memoryview(data))))
++            if len(datas) >= args.videos:
++                break
++        if len(datas) >= args.videos:
++            break
++    print(f"{len(datas)} videos, cpu_count={os.cpu_count()}")
++    print(f"{'mode':<9}{'threads':>8}{'frames':>9}{'seconds':>9}{'fps':>9}{'ms/frame':>10}")
++    for threads in (int(x) for x in args.threads.split(",")):
++        for mode in args.modes.split(","):
++            dec = sec = 0
++            for _, data in datas:
++                d, _, s = run_mode(data, mode, threads)
++                dec += d
++                sec += s
++            fps = dec / sec if sec else 0.0
++            print(f"{mode:<9}{threads:>8}{dec:>9}{sec:>9.1f}{fps:>9.0f}{1000 / fps if fps else 0:>10.3f}")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tools/simulate_sampling.py b/tools/simulate_sampling.py
+new file mode 100644
+index 0000000..91bca4c
+--- /dev/null
++++ b/tools/simulate_sampling.py
+@@ -0,0 +1,156 @@
++"""Offline sampling simulator: no GPU, no video decoding.
++
++Re-aggregates the per-frame dumps of an every-frame run (run.py --dump-frames) using only the frames a
++sampling strategy would send to the model, and scores the result against the reference with score.py.
++Grouping and selection are vidx.sampling's, i.e. exactly what the pipeline does; timestamps are the
++exact Fractions (t_num / t_den), so every frame lands in the same second as in the pipeline.
++
++    python tools/simulate_sampling.py --dumps $DRIVE/frames --ref $DRIVE/reference/ref_tune.jsonl
++    python tools/simulate_sampling.py ... --k 1,3,5,7 --adaptive 3:7,5:9 --json sim.json
++
++Only for the TUNE set (the holdout has no dumps, by design). FP16 effects are not simulated.
++"""
++import argparse
++import json
++import sys
++from fractions import Fraction
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
++
++import score  # noqa: E402
++from vidx.aggregate import aggregate, make_lines  # noqa: E402
++from vidx.sampling import iter_groups, pick  # noqa: E402
++
++# Tune acceptance (plan amendment I5): above the grader's 0.95 / 0.85 / 0.95 with margin.
++ACCEPT = {"micro_f1": 0.985, "people_exact": 0.93, "people_within1": 0.985}
++
++
++def video_id_of(npz_path):
++    """train-x.parquet__4.npz -> train-x.parquet:4 (inverse of run.npz_paths)."""
++    name = Path(npz_path).name
++    stem = name[: -len(".npz")]
++    file_part, _, row = stem.rpartition("__")
++    return f"{file_part}:{row}"
++
++
++def load_dump(path):
++    """-> [(Fraction t, counts tuple)] in decode order."""
++    import numpy as np
++
++    with np.load(path) as d:
++        t_num, t_den, counts = d["t_num"], d["t_den"], d["counts"]
++        return [(Fraction(int(a), int(b)), tuple(int(c) for c in row)) for a, b, row in zip(t_num, t_den, counts)]
++
++
++def disagree(counts_list):
++    """True if the sampled frames of a group do not all agree (presence of any class, or person count)."""
++    first = counts_list[0]
++    pres = [c > 0 for c in first]
++    for c in counts_list[1:]:
++        if c[0] != first[0] or [x > 0 for x in c] != pres:
++            return True
++    return False
++
++
++def select(frames, k, adaptive=None):
++    """Frames the pipeline would infer. adaptive=(k0, k1): k0 per group, plus pick(n, k1) when the
++    k0 frames disagree (union). Returns (selected frames in order, number inferred)."""
++    out = []
++    for group in iter_groups(frames, lambda f: f[0]):
++        n = len(group)
++        if adaptive:
++            k0, k1 = adaptive
++            idx = pick(n, k0)
++            if len(idx) > 1 and disagree([group[i][1] for i in idx]):
++                idx = sorted(set(idx) | set(pick(n, k1)))
++        else:
++            idx = pick(n, k)
++        out.extend(group[i] for i in idx)
++    return out
++
++
++def simulate(videos, ref, strategy):
++    """videos: {video_id: frames}; strategy: ("k", k) or ("adaptive", (k0, k1)). Returns a result dict."""
++    lines, inferred, total = [], 0, 0
++    for vid, frames in videos.items():
++        kind, val = strategy
++        sel = select(frames, val, None) if kind == "k" else select(frames, 0, val)
++        inferred += len(sel)
++        total += len(frames)
++        lines += make_lines(vid, aggregate(sel))
++    seconds, _ = score.parse_lines(lines)
++    cand = (seconds, dict(ref[1]))  # decode errors are not simulated: copy the reference's error lines
++    r = score.score_set("tune", ref, cand, only_common=False, filter_candidate=True)
++    m = r["metrics"]
++    ok = all(m[key] >= v for key, v in ACCEPT.items())
++    return {"strategy": strategy, "inferred": inferred, "frames": total, "fraction": inferred / max(total, 1),
++            "f1": m["micro_f1"], "exact": m["people_exact"], "within1": m["people_within1"],
++            "grader_pass": r["status"] == "PASS", "accept": ok and r["status"] == "PASS",
++            "worst": sorted(m["video_people_exact"].items(), key=lambda kv: kv[1])[:3],
++            "worst_f1": sorted(m["video_f1"].items(), key=lambda kv: kv[1])[:3]}
++
++
++def main(argv=None):
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("--dumps", required=True, help="folder of <video>.npz from run.py --dump-frames")
++    ap.add_argument("--ref", required=True, help="every-frame reference jsonl of the same videos")
++    ap.add_argument("--k", default="1,2,3,4,5,6,7,8,9", help="fixed k values, comma separated")
++    ap.add_argument("--adaptive", default="", help="k0:k1 pairs, comma separated, e.g. 3:7,5:9")
++    ap.add_argument("--json", default=None, help="also write all results here")
++    args = ap.parse_args(argv)
++
++    ref_s, ref_e = score.load_results(args.ref)
++    paths = sorted(p for p in Path(args.dumps).glob("*.npz") if not p.name.endswith(".tmp.npz"))
++    videos = {video_id_of(p): load_dump(p) for p in paths}
++    ref_videos = {v for v, _ in ref_s} | set(ref_e)
++    missing = sorted(ref_videos - set(videos))
++    extra = sorted(set(videos) - ref_videos)
++    for v in extra:
++        del videos[v]
++    if missing:
++        print(f"WARNING: {len(missing)} reference videos have no dump; they are left out of the scoring: "
++              f"{missing[:5]}{' ...' if len(missing) > 5 else ''}", file=sys.stderr)
++    if extra:
++        print(f"WARNING: {len(extra)} dumps are not in the reference and are ignored", file=sys.stderr)
++    keep = set(videos)
++    ref, _ = score.restrict((ref_s, ref_e), keep.__contains__)
++    if not videos or not ref[0]:
++        sys.exit("nothing to simulate: no dumps matching the reference")
++
++    # sanity: every-frame re-aggregation must reproduce the reference exactly
++    base = simulate(videos, ref, ("k", 0))
++    print(f"{len(videos)} videos, {base['frames']} frames, {len(ref[0])} seconds")
++    print(f"check k=0 (every frame) vs reference: F1 {base['f1']:.4f} exact {base['exact']:.4f} "
++          f"within1 {base['within1']:.4f}  (must be 1.0000)")
++
++    strategies = [("k", int(k)) for k in args.k.split(",") if k.strip()]
++    for pair in filter(None, (p.strip() for p in args.adaptive.split(","))):
++        k0, k1 = (int(x) for x in pair.split(":"))
++        strategies.append(("adaptive", (k0, k1)))
++    print(f"accept on tune: F1 >= {ACCEPT['micro_f1']}, exact >= {ACCEPT['people_exact']}, "
++          f"within1 >= {ACCEPT['people_within1']}")
++    print(f"{'strategy':<14}{'inferred':>10}{'speedup':>9}{'F1':>8}{'exact':>8}{'within1':>9}  grader  accept")
++    results = [base]
++    for st in strategies:
++        r = simulate(videos, ref, st)
++        results.append(r)
++        name = f"k={st[1]}" if st[0] == "k" else f"adapt {st[1][0]}:{st[1][1]}"
++        print(f"{name:<14}{r['fraction']:>10.3f}{1 / max(r['fraction'], 1e-9):>8.1f}x{r['f1']:>8.4f}"
++              f"{r['exact']:>8.4f}{r['within1']:>9.4f}  {'PASS' if r['grader_pass'] else 'FAIL':<6}  "
++              f"{'yes' if r['accept'] else 'no'}")
++    print("\nworst videos per strategy (people exact | F1):")
++    for r in results[1:]:
++        st = r["strategy"]
++        name = f"k={st[1]}" if st[0] == "k" else f"adapt {st[1][0]}:{st[1][1]}"
++        w = ", ".join(f"{v.rpartition(':')[2]}={x:.3f}" for v, x in r["worst"])
++        wf = ", ".join(f"{v.rpartition(':')[2]}={x:.3f}" for v, x in r["worst_f1"])
++        print(f"  {name:<14} exact: {w} | F1: {wf}")
++    if args.json:
++        with open(args.json, "w", encoding="utf-8") as f:
++            json.dump([{**r, "strategy": list(r["strategy"])} for r in results], f, indent=2, default=str)
++    return 0 if base["f1"] == base["exact"] == base["within1"] == 1.0 else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/vidx/checkpoint.py b/vidx/checkpoint.py
+index d5b28f4..d1cefa0 100644
+--- a/vidx/checkpoint.py
++++ b/vidx/checkpoint.py
+@@ -24,7 +24,7 @@ log = logging.getLogger("vidx.checkpoint")
+ KEEP = 2  # generations kept per store
+ PAYLOAD = ("results.jsonl.gz", "done.txt", "progress.json")
+ FILES = PAYLOAD + ("manifest.json",)  # manifest last
+-TIMER_KEYS = ("decode", "infer", "aggregate", "frames", "videos", "errors")
++TIMER_KEYS = ("decode", "infer", "aggregate", "frames", "inferred_frames", "videos", "errors")
+ 
+ 
+ class CheckpointError(RuntimeError):
+@@ -35,10 +35,13 @@ def gen_name(n):
+     return f"gen-{n:04d}"
+ 
+ 
+-def make_fingerprint(input_path, limit_videos, output, run_name):
++def make_fingerprint(input_path, limit_videos, output, run_name, config=None):
+     """What must be identical for a resume. The parquet files themselves are checked separately
+-    (Checkpointer.inputs_used), so files added to the input folder later do not matter."""
++    (Checkpointer.inputs_used), so files added to the input folder later do not matter.
++    config: settings that change the results (sampling, precision), so a resume never mixes them."""
+     fp = {"input": str(input_path), "limit_videos": limit_videos, "output": Path(output).name, "run_name": run_name}
++    if config:
++        fp["config"] = config
+     return json.loads(json.dumps(fp))
+ 
+ 
+diff --git a/vidx/decode.py b/vidx/decode.py
+index 7c645ce..ce11d9d 100644
+--- a/vidx/decode.py
++++ b/vidx/decode.py
+@@ -149,11 +149,17 @@ def _open(data):
+     return av.open(io.BytesIO(memoryview(data)))
+ 
+ 
+-def decode_video(data):
++def decode_video(data, sample=0, counter=None):
+     """Generator of Frame for the first real video stream. Raises on open/decode errors.
+ 
+-    Frames yielded before an error are valid; the caller decides what to do with them.
++    sample=K > 0: every frame is still decoded and timestamped, but only K evenly spaced frames
++    per second (vidx.sampling) are converted to BGR, rotated and yielded. sample=0: every frame.
++    counter: optional object whose `decoded_frames` attribute is incremented per decoded frame.
++    Frames yielded before an error are valid (with sampling, the second in progress is sampled
++    and yielded before the error is re-raised); the caller decides what to do with them.
+     """
++    from .sampling import sample_groups
++
+     container = _open(data)
+     try:
+         stream = pick_video_stream(container)
+@@ -163,8 +169,17 @@ def decode_video(data):
+         rate = stream.guessed_rate or stream.average_rate
+         stamper = Timestamper(stream.time_base, rate)
+         base_rotation = stream_rotation(stream)
+-        for frame in container.decode(stream):
+-            t = stamper.stamp(frame.pts)
++
++        def stamped():
++            for frame in container.decode(stream):
++                if counter is not None:
++                    counter.decoded_frames += 1
++                yield frame, stamper.stamp(frame.pts)
++
++        raw = stamped()
++        if sample > 0:
++            raw = sample_groups(raw, lambda item: item[1], sample)
++        for frame, t in raw:
+             rot = frame_rotation(frame, base_rotation)
+             image = frame.to_ndarray(format="bgr24")
+             if rot:
+diff --git a/vidx/model.py b/vidx/model.py
+index d44608c..170f5ee 100644
+--- a/vidx/model.py
++++ b/vidx/model.py
+@@ -1,6 +1,7 @@
+ """YOLO11l behind load_model() / infer(); swap this module for another backend later."""
+ import os
+ import tempfile
++import time
+ from pathlib import Path
+ 
+ from .aggregate import COCO_IDS
+@@ -30,12 +31,16 @@ def summarize(cls_ids, confs):
+ 
+ 
+ class Model:
+-    def __init__(self, yolo, device):
++    def __init__(self, yolo, device, half=False):
+         self.yolo = yolo
+         self.device = device
++        self.half = half
++        # Stage-0 profile: Ultralytics' per-image ms summed over all images, plus predict() wall time
++        self.speed = {"preprocess_ms": 0.0, "inference_ms": 0.0, "postprocess_ms": 0.0,
++                      "predict_wall_s": 0.0, "predict_calls": 0, "images": 0}
+ 
+ 
+-def load_model(weights=None, device=None, offline=True):
++def load_model(weights=None, device=None, offline=True, half=False):
+     weights = Path(weights) if weights else default_weights()
+     weights = weights.resolve()
+     if not weights.is_file():
+@@ -54,7 +59,8 @@ def load_model(weights=None, device=None, offline=True):
+         pass
+     if device is None:
+         device = "cuda:0" if torch.cuda.is_available() else "cpu"
+-    return Model(YOLO(str(weights), task="detect"), device)
++    half = bool(half) and str(device).startswith("cuda")  # FP16 only on the GPU
++    return Model(YOLO(str(weights), task="detect"), device, half)
+ 
+ 
+ def infer(model, frames, classes=COCO_IDS):
+@@ -62,12 +68,21 @@ def infer(model, frames, classes=COCO_IDS):
+ 
+     classes=None disables the class filter (counts are still reported for the 5 classes).
+     """
++    t0 = time.perf_counter()
+     results = model.yolo.predict(
+-        frames, imgsz=IMGSZ, conf=CONF, iou=IOU, half=False, verbose=False,
++        frames, imgsz=IMGSZ, conf=CONF, iou=IOU, half=model.half, verbose=False,
+         device=model.device, classes=classes, save=False,
+     )
++    sp = model.speed
++    sp["predict_wall_s"] += time.perf_counter() - t0
++    sp["predict_calls"] += 1
+     out = []
+     for r in results:
++        speed = getattr(r, "speed", None) or {}
++        sp["preprocess_ms"] += speed.get("preprocess") or 0.0
++        sp["inference_ms"] += speed.get("inference") or 0.0
++        sp["postprocess_ms"] += speed.get("postprocess") or 0.0
++        sp["images"] += 1
+         if r.boxes is None or len(r.boxes) == 0:
+             out.append(summarize([], []))
+         else:
+diff --git a/vidx/sampling.py b/vidx/sampling.py
+new file mode 100644
+index 0000000..6532243
+--- /dev/null
++++ b/vidx/sampling.py
+@@ -0,0 +1,60 @@
++"""Per-second frame sampling. Standard library only.
++
++Used by both the decoder (vidx.decode) and the offline simulator (tools/simulate_sampling.py),
++so the simulator's scores predict the pipeline exactly: same grouping, same selection.
++
++A "group" is a run of consecutive frames whose int(t) is the same second. A group closes as soon
++as a frame of a different second arrives (also when timestamps go backwards), so a second can, in
++rare broken files, produce two groups; both the simulator and the pipeline then sample each group.
++Every group yields at least one frame, so every second that holds a frame keeps an output line.
++"""
++
++
++def pick(n, k):
++    """Indices of the frames to keep from a group of n frames: k evenly spaced ones.
++
++    k <= 0 (sampling off) or n <= k -> all n frames. Otherwise the centres of k equal slices:
++    floor((j + 0.5) * n / k) for j in 0..k-1 (strictly increasing because n > k).
++    """
++    if k <= 0 or n <= k:
++        return list(range(n))
++    return [(2 * j + 1) * n // (2 * k) for j in range(k)]
++
++
++def second_of(t):
++    """Second index of a timestamp (Fraction or int, >= 0); same rule as vidx.aggregate."""
++    return int(t // 1)
++
++
++def iter_groups(items, t_of):
++    """Yield lists of consecutive items that share a second (see module docstring).
++
++    If the iterable raises (decode failure), the group collected so far is yielded first and then
++    the exception is re-raised, so frames decoded before the error are never lost.
++    """
++    group = []
++    current = None
++    it = iter(items)
++    while True:
++        try:
++            item = next(it)
++        except StopIteration:
++            break
++        except Exception:
++            if group:
++                yield group
++            raise
++        s = second_of(t_of(item))
++        if group and s != current:
++            yield group
++            group = []
++        current = s
++        group.append(item)
++    if group:
++        yield group
++
++
++def sample_groups(items, t_of, k):
++    """Yield the selected items (pick(n, k) of each group), group by group, in input order."""
++    for group in iter_groups(items, t_of):
++        yield from (group[i] for i in pick(len(group), k))

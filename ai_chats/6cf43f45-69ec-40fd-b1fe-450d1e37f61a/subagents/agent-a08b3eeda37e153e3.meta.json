@@ -1,0 +1,1 @@
+{"agentType":"general-purpose","isBuiltIn":true,"description":"Implement tune/holdout plan (Sonnet)","toolUseId":"toolu_01Nm3J6Pq2N2STRtLrsEpSBc","spawnDepth":1,"requestShape":"background","requestNonInteractive":true,"model":"sonnet","pickedEffortModel":"claude-opus-5-5","finished":true}

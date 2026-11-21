@@ -1,0 +1,1 @@
+{"agentType":"general-purpose","isBuiltIn":true,"description":"/code-review high run.py score.py bench.py tools/…","name":"code-review","spawnDepth":1,"requestShape":"background","requestNonInteractive":true,"pickedEffortModel":"claude-opus-5-5","finished":true}

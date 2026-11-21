@@ -1,0 +1,667 @@
+     1	import json
+     2	import os
+     3	import sys
+     4	import tempfile
+     5	import unittest
+     6	from pathlib import Path
+     7	from types import SimpleNamespace
+     8	
+     9	sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    10	
+    11	from vidx.checkpoint import (  # noqa: E402
+    12	    Checkpointer, CheckpointError, DirStore, HFStore, make_fingerprint, validate_generation,
+    13	)
+    14	from vidx.output import OutputWriter, sidecar_path  # noqa: E402
+    15	
+    16	FP = make_fingerprint([("a.parquet", 100)], None, "results.jsonl")
+    17	TIMERS = SimpleNamespace(decode=1.0, infer=2.0, aggregate=0.5, frames=10, videos=2, errors=0)
+    18	
+    19	
+    20	class FakeHfApi:
+    21	    """The few HfApi calls HFStore uses, on an in-memory repo (no network)."""
+    22	
+    23	    def __init__(self):
+    24	        self.files = {}
+    25	        self.commits = 0
+    26	
+    27	    def list_repo_files(self, repo, repo_type=None):
+    28	        return sorted(self.files)
+    29	
+    30	    def upload_folder(self, folder_path, path_in_repo, repo_id, repo_type, commit_message):
+    31	        self.commits += 1
+    32	        root = Path(folder_path)
+    33	        for p in root.rglob("*"):
+    34	            if p.is_file():
+    35	                self.files[f"{path_in_repo}/{p.relative_to(root).as_posix()}"] = p.read_bytes()
+    36	
+    37	    def delete_folder(self, path_in_repo, repo_id, repo_type):
+    38	        self.commits += 1
+    39	        self.files = {k: v for k, v in self.files.items() if not k.startswith(path_in_repo + "/")}
+    40	
+    41	    def hf_hub_download(self, repo_id, filename, repo_type, local_dir):
+    42	        target = Path(local_dir) / filename
+    43	        target.parent.mkdir(parents=True, exist_ok=True)
+    44	        target.write_bytes(self.files[filename])
+    45	        return str(target)
+    46	
+    47	
+    48	class Base(unittest.TestCase):
+    49	    def setUp(self):
+    50	        self.tmp = tempfile.TemporaryDirectory()
+    51	        self.root = Path(self.tmp.name)
+    52	        self.out = self.root / "work" / "results.jsonl"
+    53	        self.ckdir = self.root / "drive"
+    54	
+    55	    def tearDown(self):
+    56	        self.tmp.cleanup()
+    57	
+    58	    def write_videos(self, ids, resume=False):
+    59	        w = OutputWriter(self.out, resume=resume)
+    60	        for v in ids:
+    61	            w.write_video(v, [{"video": v, "second": s, "objects": [], "people": 0} for s in range(2)])
+    62	        w.close()
+    63	
+    64	    def ckpt(self, stores=None, **kw):
+    65	        return Checkpointer(stores or [DirStore(self.ckdir, "r")], self.out, kw.pop("fp", FP), **kw)
+    66	
+    67	    def wipe_local(self):
+    68	        self.out.unlink()
+    69	        sidecar_path(self.out).unlink()
+    70	
+    71	    def gen_dir(self, n):
+    72	        return self.ckdir / "r" / f"gen-{n:04d}"
+    73	
+    74	
+    75	class DirCheckpointTest(Base):
+    76	    def test_snapshot_restore_round_trip(self):
+    77	        self.write_videos(["a:0", "a:1", "a:2"])
+    78	        before = (self.out.read_bytes(), sidecar_path(self.out).read_bytes())
+    79	        self.ckpt().snapshot(TIMERS)
+    80	        self.wipe_local()
+    81	        msg = self.ckpt().restore()
+    82	        self.assertIn("restored 3 videos", msg)
+    83	        self.assertEqual((self.out.read_bytes(), sidecar_path(self.out).read_bytes()), before)
+    84	        w = OutputWriter(self.out, resume=True)
+    85	        self.assertEqual(w.done, {"a:0", "a:1", "a:2"})
+    86	        w.close()
+    87	
+    88	    def test_keeps_only_two_generations(self):
+    89	        self.write_videos(["a:0"])
+    90	        c = self.ckpt()
+    91	        for _ in range(4):
+    92	            c.snapshot(TIMERS)
+    93	        self.assertEqual(DirStore(self.ckdir, "r").list_gens(), [3, 4])
+    94	
+    95	    def test_generation_without_manifest_or_with_bad_hash_is_skipped(self):
+    96	        self.write_videos(["a:0"])
+    97	        c = self.ckpt()
+    98	        c.snapshot(TIMERS)  # gen 1: 1 video
+    99	        self.write_videos(["a:1"], resume=True)
+   100	        c.snapshot(TIMERS)  # gen 2: 2 videos
+   101	        self.write_videos(["a:2"], resume=True)
+   102	        c.snapshot(TIMERS)  # gen 3: 3 videos (gen 1 pruned, gen 2 + 3 remain)
+   103	        self.assertTrue(validate_generation(self.gen_dir(3)))
+   104	        (self.gen_dir(3) / "manifest.json").unlink()  # crash before the manifest was written
+   105	        self.wipe_local()
+   106	        self.assertIn("restored 2 videos", self.ckpt().restore())
+   107	
+   108	        data = (self.gen_dir(2) / "done.txt").read_bytes()  # same size, different content
+   109	        (self.gen_dir(2) / "done.txt").write_bytes(data.replace(b"a:", b"b:"))
+   110	        self.assertIsNone(validate_generation(self.gen_dir(2)))
+   111	        self.wipe_local()
+   112	        self.assertIn("no checkpoint found", self.ckpt().restore())
+   113	
+   114	    def test_mismatched_fingerprint_is_refused(self):
+   115	        self.write_videos(["a:0"])
+   116	        self.ckpt().snapshot(TIMERS)
+   117	        self.wipe_local()
+   118	        other = make_fingerprint([("a.parquet", 999)], None, "results.jsonl")
+   119	        with self.assertRaises(CheckpointError):
+   120	            self.ckpt(fp=other).restore()
+   121	        self.assertFalse(self.out.exists())
+   122	
+   123	    def test_local_newer_than_checkpoint_wins(self):
+   124	        self.write_videos(["a:0"])
+   125	        self.ckpt().snapshot(TIMERS)
+   126	        self.write_videos(["a:1"], resume=True)
+   127	        local = self.out.read_bytes()
+   128	        self.assertIn("local files are as new", self.ckpt().restore())
+   129	        self.assertEqual(self.out.read_bytes(), local)
+   130	
+   131	    def test_output_without_sidecar_is_unusable_so_checkpoint_wins(self):
+   132	        self.write_videos(["a:0", "a:1"])
+   133	        self.ckpt().snapshot(TIMERS)
+   134	        sidecar_path(self.out).unlink()
+   135	        self.assertIn("restored 2 videos", self.ckpt().restore())
+   136	
+   137	    def test_restore_removes_leftover_tmp_files(self):
+   138	        self.write_videos(["a:0"])
+   139	        self.ckpt().snapshot(TIMERS)
+   140	        tmps = [Path(str(self.out) + ".tmp"), Path(str(sidecar_path(self.out)) + ".tmp")]
+   141	        for t in tmps:
+   142	            t.write_text("junk")
+   143	        self.ckpt().restore()
+   144	        self.assertFalse(any(t.exists() for t in tmps))
+   145	
+   146	    def test_has_existing(self):
+   147	        self.assertFalse(self.ckpt().has_existing())
+   148	        self.write_videos(["a:0"])
+   149	        self.ckpt().snapshot(TIMERS)
+   150	        self.assertTrue(self.ckpt().has_existing())
+   151	        self.assertFalse(self.ckpt([DirStore(self.ckdir, "other-run")]).has_existing())
+   152	
+   153	    def test_failing_store_only_warns_and_the_other_store_still_gets_the_snapshot(self):
+   154	        class Broken(DirStore):
+   155	            def publish(self, staging, n):
+   156	                raise OSError("Drive disconnected")
+   157	
+   158	        self.write_videos(["a:0"])
+   159	        c = self.ckpt([Broken(self.root / "bad", "r"), DirStore(self.ckdir, "r")])
+   160	        with self.assertLogs("vidx.checkpoint", "WARNING"):
+   161	            c.snapshot(TIMERS)  # must not raise
+   162	        self.assertEqual(DirStore(self.ckdir, "r").list_gens(), [1])
+   163	
+   164	    def test_unreadable_output_does_not_raise(self):
+   165	        c = self.ckpt()  # output file does not exist
+   166	        with self.assertLogs("vidx.checkpoint", "WARNING"):
+   167	            c.snapshot(TIMERS)
+   168	
+   169	    def test_maybe_snapshot_waits_for_the_interval(self):
+   170	        self.write_videos(["a:0"])
+   171	        now = [0.0]
+   172	        c = self.ckpt(minutes=10, clock=lambda: now[0])
+   173	        c.maybe_snapshot(TIMERS)
+   174	        self.assertEqual(DirStore(self.ckdir, "r").list_gens(), [])
+   175	        now[0] = 601
+   176	        c.maybe_snapshot(TIMERS)
+   177	        c.maybe_snapshot(TIMERS)  # interval restarted
+   178	        self.assertEqual(DirStore(self.ckdir, "r").list_gens(), [1])
+   179	
+   180	    def test_compute_time_accumulates_across_two_sessions(self):
+   181	        self.write_videos(["a:0"])
+   182	        now = [1000.0]
+   183	        c1 = self.ckpt(clock=lambda: now[0], wall=lambda: 1_700_000_000.0)
+   184	        now[0] = 1100.0
+   185	        c1.snapshot(TIMERS)
+   186	        self.wipe_local()  # runtime reset: new session, new clock
+   187	        now = [5.0]
+   188	        c2 = self.ckpt(clock=lambda: now[0], wall=lambda: 1_700_001_000.0)
+   189	        c2.restore()
+   190	        now[0] = 55.0
+   191	        c2.snapshot(TIMERS)
+   192	        progress = json.loads((self.gen_dir(2) / "progress.json").read_text())
+   193	        self.assertEqual(progress["compute_s"], 150.0)
+   194	        self.assertEqual(progress["sessions"], 2)
+   195	        self.assertEqual(progress["timers"]["frames"], 20)
+   196	        self.assertEqual(progress["wall_first_start"], "2023-11-14T22:13:20+00:00")
+   197	        self.assertEqual(progress["wall_last_end"], "2023-11-14T22:30:00+00:00")
+   198	
+   199	
+   200	class HFCheckpointTest(Base):
+   201	    def test_one_commit_per_generation_and_round_trip(self):
+   202	        api = FakeHfApi()
+   203	        store = HFStore("me/ckpt", "r", api=api)
+   204	        self.write_videos(["a:0"])
+   205	        c = self.ckpt([store])
+   206	        c.snapshot(TIMERS)
+   207	        self.assertEqual(api.commits, 1)
+   208	        self.assertIn("r/gen-0001/manifest.json", api.files)
+   209	        self.write_videos(["a:1"], resume=True)
+   210	        c.snapshot(TIMERS)
+   211	        self.assertEqual(api.commits, 2)
+   212	        c.snapshot(TIMERS)  # third generation: gen-0001 is pruned (one extra delete commit)
+   213	        self.assertEqual(store.list_gens(), [2, 3])
+   214	        self.assertEqual(api.commits, 4)
+   215	        self.wipe_local()
+   216	        self.assertIn("restored 2 videos", self.ckpt([HFStore("me/ckpt", "r", api=api)]).restore())
+   217	
+   218	    def test_dump_frames_are_uploaded_once_outside_the_generations(self):
+   219	        api = FakeHfApi()
+   220	        frames = self.root / "frames"
+   221	        frames.mkdir()
+   222	        (frames / "a__0.npz").write_bytes(b"x")
+   223	        (frames / "a__1.tmp.npz").write_bytes(b"half")
+   224	        self.write_videos(["a:0"])
+   225	        c = self.ckpt([HFStore("me/ckpt", "r", api=api)], dump_dir=frames)
+   226	        c.snapshot(TIMERS)
+   227	        (frames / "a__2.npz").write_bytes(b"y")
+   228	        c.snapshot(TIMERS)
+   229	        c.snapshot(TIMERS)  # prunes gen 1; frames stay
+   230	        self.assertEqual(sorted(k for k in api.files if "/frames/" in k), ["r/frames/a__0.npz", "r/frames/a__2.npz"])
+   231	
+   232	    def test_hf_failure_only_warns(self):
+   233	        api = FakeHfApi()
+   234	
+   235	        def boom(**kw):
+   236	            raise ConnectionError("offline")
+   237	
+   238	        api.upload_folder = boom
+   239	        self.write_videos(["a:0"])
+   240	        with self.assertLogs("vidx.checkpoint", "WARNING"):
+   241	            self.ckpt([HFStore("me/ckpt", "r", api=api)]).snapshot(TIMERS)
+   242	
+   243	
+   244	if __name__ == "__main__":
+   245	    unittest.main()
+    def test_decode_error_keeps_lines_and_one_error(self):
+        lines = self.run_video(FakeInfer(), decode=fake_decode(5, fail_after=3))
+        self.assertEqual(len([l for l in lines if "error" in l]), 1)
+        self.assertEqual(len([l for l in lines if "second" in l]), 2)
+
+    def test_dump_failure_keeps_lines(self):
+        orig = run.dump_frames
+
+        def boom(*a):
+            raise OSError("disk full")
+
+        run.dump_frames = boom
+        try:
+            lines = self.run_video(FakeInfer(), args=make_args(dump_frames="somewhere"))
+        finally:
+            run.dump_frames = orig
+        self.assertEqual([l["second"] for l in lines], [0, 1])
+
+
+class MainAbortTest(unittest.TestCase):
+    def test_three_inference_failures_in_a_row_abort_without_writing(self):
+        import tempfile
+        from pathlib import Path
+
+        import vidx.decode
+        import vidx.model
+        import vidx.source
+
+        saved = (vidx.decode.decode_video, vidx.model.load_model, vidx.model.infer, vidx.source.iter_rows)
+
+        def bad_infer(model, images):
+            raise RuntimeError("driver broke")
+
+        vidx.decode.decode_video = fake_decode()
+        vidx.model.load_model = lambda: SimpleNamespace(device="cpu")
+        vidx.model.infer = bad_infer
+        vidx.source.iter_rows = lambda path: ((f"p:{i}", b"", None) for i in range(10))
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                (Path(tmp) / "a.parquet").touch()
+                out = Path(tmp) / "r.jsonl"
+                rc = run.main(["--input", tmp, "--output", str(out)])
+                self.assertEqual(rc, 3)
+                self.assertEqual(out.read_text(), "")
+                self.assertEqual(Path(str(out) + ".done").read_text(), "")
+        finally:
+            (vidx.decode.decode_video, vidx.model.load_model, vidx.model.infer, vidx.source.iter_rows) = saved
+
+
+def fake_decode_by_data(data):
+    """Deterministic fake video: data is the video id as bytes; person count depends on it."""
+    n = 2 + len(data) % 3
+    for i in range(n):
+        yield frame(F(i, 2), person=(len(data) + i) % 4)
+
+
+class FakeRun:
+    """Patches the heavy modules so run.main() works on fake videos; restores them afterwards."""
+
+    def __init__(self, n_videos=8, crash_after=None, bad_infer=False):
+        import tempfile
+
+        self.n, self.crash_after, self.bad_infer = n_videos, crash_after, bad_infer
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        (self.root / "in").mkdir()
+        (self.root / "in" / "a.parquet").write_bytes(b"x" * 10)
+
+    def rows(self, path):
+        for i in range(self.n):
+            if self.crash_after is not None and i >= self.crash_after:
+                raise KeyboardInterrupt  # stands in for a kill; `finally` still runs
+            yield f"a.parquet:{i}", f"video{i * 7}".encode(), None
+
+    def __enter__(self):
+        import vidx.decode
+        import vidx.model
+        import vidx.source
+
+        self.mods = (vidx.decode, vidx.model, vidx.source)
+        self.saved = (vidx.decode.decode_video, vidx.model.load_model, vidx.model.infer, vidx.source.iter_rows)
+        vidx.decode.decode_video = fake_decode_by_data
+        vidx.model.load_model = lambda: SimpleNamespace(device="cpu")
+        vidx.model.infer = lambda model, images: FakeInfer()(images) if not self.bad_infer else 1 / 0
+        vidx.source.iter_rows = self.rows
+        return self
+
+    def __exit__(self, *exc):
+        d, m, s = self.mods
+        d.decode_video, m.load_model, m.infer, s.iter_rows = self.saved
+        self.tmp.cleanup()
+
+    def main(self, out, *extra):
+        return run.main(["--input", str(self.root / "in"), "--output", str(self.root / out), *extra])
+
+    def text(self, out):
+        return (self.root / out).read_text(encoding="utf-8")
+
+
+class CheckpointMainTest(unittest.TestCase):
+    def test_plain_run_does_not_import_checkpoint_module_or_write_extra_files(self):
+        sys.modules.pop("vidx.checkpoint", None)
+        with FakeRun() as fr:
+            self.assertEqual(fr.main("r.jsonl"), 0)
+            self.assertNotIn("vidx.checkpoint", sys.modules)
+            self.assertEqual(sorted(p.name for p in fr.root.iterdir()), ["in", "r.jsonl", "r.jsonl.done"])
+
+    def test_fresh_run_against_existing_checkpoint_exits_2(self):
+        with FakeRun() as fr:
+            ck = str(fr.root / "drive")
+            self.assertEqual(fr.main("r.jsonl", "--checkpoint-dir", ck), 0)
+            before = fr.text("r.jsonl")
+            self.assertEqual(fr.main("r.jsonl", "--checkpoint-dir", ck), 2)
+            self.assertEqual(fr.text("r.jsonl"), before)  # not overwritten
+            self.assertEqual(fr.main("r.jsonl", "--checkpoint-dir", ck, "--run-name", "other"), 0)
+
+    def test_resume_from_checkpoint_after_losing_local_files_matches_uninterrupted_run(self):
+        # Parquet fixture: .venv has no pyarrow, so iter_rows and decode are faked (see FakeRun).
+        with FakeRun(n_videos=8) as ref:
+            self.assertEqual(ref.main("ref.jsonl"), 0)
+            expected = sorted(ref.text("ref.jsonl").splitlines())
+        with FakeRun(n_videos=8, crash_after=5) as fr:
+            ck = str(fr.root / "drive")
+            with self.assertRaises(KeyboardInterrupt):
+                fr.main("r.jsonl", "--checkpoint-dir", ck, "--checkpoint-minutes", "0")
+            (fr.root / "r.jsonl").unlink()  # runtime reset: local disk is gone
+            (fr.root / "r.jsonl.done").unlink()
+            fr.crash_after = None
+            self.assertEqual(fr.main("r.jsonl", "--checkpoint-dir", ck, "--resume"), 0)
+            self.assertEqual(sorted(fr.text("r.jsonl").splitlines()), expected)
+            done = (fr.root / "r.jsonl.done").read_text().splitlines()
+            self.assertEqual(len(done), 8)
+
+    def test_snapshot_oserror_keeps_run_and_exit_code(self):
+        import vidx.checkpoint as cp
+
+        orig = cp.DirStore.publish
+
+        def boom(self, staging, n):
+            raise OSError("Drive disconnected")
+
+        cp.DirStore.publish = boom
+        try:
+            with FakeRun() as fr:
+                ck = str(fr.root / "drive")
+                self.assertEqual(fr.main("r.jsonl", "--checkpoint-dir", ck, "--checkpoint-minutes", "0"), 0)
+                self.assertEqual(len((fr.root / "r.jsonl.done").read_text().splitlines()), 8)
+            with FakeRun(bad_infer=True) as fr:
+                ck = str(fr.root / "drive")
+                self.assertEqual(fr.main("r.jsonl", "--checkpoint-dir", ck), 3)  # abort code preserved
+        finally:
+            cp.DirStore.publish = orig
+
+    def test_npz_temp_name_ends_with_npz_and_differs_from_final(self):
+        tmp, final = run.npz_paths("d", "a.parquet:3")
+        self.assertEqual((tmp.name, final.name), ("a.parquet__3.tmp.npz", "a.parquet__3.npz"))
+        try:
+            import numpy as np
+        except ImportError:
+            return
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            rec = run.Record(F(0), [1, 0, 0, 0, 0], [0.9] * 5, 0, 0, (4, 6, 3))
+            run.dump_frames(d, "a.parquet:3", [rec])
+            self.assertEqual(sorted(p.name for p in Path(d).iterdir()), ["a.parquet__3.npz"])
+            self.assertEqual(np.load(Path(d) / final.name)["counts"].tolist(), [[1, 0, 0, 0, 0]])
+
+
+class SummarizeTest(unittest.TestCase):
+    def test_summarize(self):
+        counts, best = summarize([0, 0, 2, 67, 5], [0.5, 0.9, 0.6, 0.41, 0.99])
+        self.assertEqual(counts, [2, 1, 0, 0, 1])  # class 5 (bus) ignored
+        self.assertEqual(best, [0.9, 0.6, 0.0, 0.0, 0.41])
+
+
+if __name__ == "__main__":
+    unittest.main()
+import json
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from vidx.output import OutputWriter, ResumeError, sidecar_path  # noqa: E402
+
+
+def lines_for(video, n):
+    return [{"video": video, "second": s, "objects": [], "people": 0} for s in range(n)]
+
+
+class OutputTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.out = Path(self.tmp.name) / "results.jsonl"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def read(self):
+        return [json.loads(x) for x in self.out.read_text(encoding="utf-8").splitlines()]
+
+    def test_write_and_sidecar(self):
+        w = OutputWriter(self.out)
+        w.write_video("a:0", lines_for("a:0", 2))
+        w.write_video("a:1", [{"video": "a:1", "error": "bad"}])
+        w.close()
+        self.assertEqual(len(self.read()), 3)
+        self.assertEqual(sidecar_path(self.out).read_text().split("\n"), ["a:0\t2", "a:1\t1", ""])
+
+    def test_fresh_run_resets_old_files(self):
+        w = OutputWriter(self.out)
+        w.write_video("a:0", lines_for("a:0", 2))
+        w.close()
+        w = OutputWriter(self.out)  # no resume: start over
+        w.close()
+        self.assertEqual(self.out.read_text(), "")
+        self.assertEqual(sidecar_path(self.out).read_text(), "")
+
+    def test_resume_drops_half_written_video(self):
+        w = OutputWriter(self.out)
+        w.write_video("a:0", lines_for("a:0", 2))
+        w.close()
+        # crash: lines of a:1 reached the output (one truncated), sidecar never got a:1
+        with open(self.out, "a", encoding="utf-8") as f:
+            f.write(json.dumps(lines_for("a:1", 1)[0]) + "\n")
+            f.write('{"video": "a:1", "sec')
+        w = OutputWriter(self.out, resume=True)
+        self.assertTrue(w.is_done("a:0"))
+        self.assertFalse(w.is_done("a:1"))
+        w.write_video("a:1", lines_for("a:1", 3))
+        w.close()
+        rows = self.read()
+        self.assertEqual([r["video"] for r in rows], ["a:0", "a:0", "a:1", "a:1", "a:1"])
+
+    def test_resume_redoes_video_whose_last_line_was_cut_off(self):
+        w = OutputWriter(self.out)
+        w.write_video("a:0", lines_for("a:0", 2))
+        w.write_video("a:1", lines_for("a:1", 3))
+        w.close()
+        text = self.out.read_text(encoding="utf-8")
+        self.out.write_text(text[:-10], encoding="utf-8")  # sidecar says a:1 is done, its last line is cut
+        w = OutputWriter(self.out, resume=True)
+        self.assertEqual(w.done, {"a:0"})
+        w.close()
+        self.assertEqual([r["video"] for r in self.read()], ["a:0", "a:0"])
+        self.assertEqual(sidecar_path(self.out).read_text(), "a:0\t2\n")
+
+    def test_resume_accepts_plain_sidecar_lines(self):
+        self.out.write_text("".join(json.dumps(x) + "\n" for x in lines_for("a:0", 2)), encoding="utf-8")
+        sidecar_path(self.out).write_text("a:0\n", encoding="utf-8")  # format of earlier runs
+        w = OutputWriter(self.out, resume=True)
+        self.assertEqual(w.done, {"a:0"})
+        w.close()
+        self.assertEqual(len(self.read()), 2)
+        self.assertEqual(sidecar_path(self.out).read_text(), "a:0\t2\n")  # upgraded with the count
+
+    def test_resume_ignores_truncated_sidecar_entry(self):
+        w = OutputWriter(self.out)
+        w.write_video("a:1", lines_for("a:1", 1))
+        w.close()
+        with open(sidecar_path(self.out), "a", encoding="utf-8") as f:
+            f.write("a:1")  # "a:1x" truncated mid-write, no newline
+        with open(self.out, "a", encoding="utf-8") as f:
+            f.write(json.dumps(lines_for("a:12", 1)[0]) + "\n")
+        w = OutputWriter(self.out, resume=True)
+        self.assertEqual(w.done, {"a:1"})
+        w.close()
+        self.assertEqual([r["video"] for r in self.read()], ["a:1"])
+
+    def test_resume_with_output_but_no_sidecar_refuses(self):
+        w = OutputWriter(self.out)
+        w.write_video("a:0", lines_for("a:0", 2))
+        w.close()
+        sidecar_path(self.out).unlink()
+        before = self.out.read_text()
+        with self.assertRaises(ResumeError) as cm:
+            OutputWriter(self.out, resume=True)
+        self.assertIn("sidecar", str(cm.exception))
+        self.assertEqual(self.out.read_text(), before)  # not wiped
+        OutputWriter(self.out).close()  # without --resume it starts fresh
+
+    def test_resume_with_empty_output_and_no_sidecar_is_fine(self):
+        self.out.write_text("")
+        w = OutputWriter(self.out, resume=True)
+        self.assertEqual(w.done, set())
+        w.close()
+
+    def test_resume_without_existing_files(self):
+        w = OutputWriter(self.out, resume=True)
+        self.assertEqual(w.done, set())
+        w.close()
+
+
+if __name__ == "__main__":
+    unittest.main()
+1:# Colab L4 setup (VS Code Colab extension)
+2:
+3:Run these in a terminal / cells on the Colab runtime. Never paste the HF token into a file or a cell
+4:that gets saved; use a Colab Secret (name it `HF_TOKEN`, enable notebook access).
+5:
+6:## 1. Check the machine
+7:```
+8:nvidia-smi
+9:df -h /content
+10:free -h
+11:python3 --version
+12:```
+13:Need an L4 (24 GB), about 25 GB data plus headroom free on disk. Note the numbers for HARDWARE.md.
+14:
+15:## 2. Python 3.11 venv (the grader uses 3.11, Colab's default may differ)
+16:```
+17:python3 --version                                  # if already 3.11, skip the next line
+18:sudo apt-get update && sudo apt-get install -y python3.11 python3.11-venv   # may need the deadsnakes PPA
+19:# alternative: pip install uv && uv venv --python 3.11 .venv
+20:python3.11 -m venv /content/venv && source /content/venv/bin/activate
+21:```
+22:
+23:## 3. Get the code and install
+24:```
+25:cd /content && git clone <this repo url> video-indexing-yolo11 && cd video-indexing-yolo11
+26:sudo apt-get install -y libgl1 libglib2.0-0        # needed by opencv-python
+27:pip install -r requirements.txt
+28:python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+29:python prepare.py                                  # downloads yolo11l.pt, loads it once
+30:```
+31:If a pin fails to resolve, fix it in `requirements.txt` and log it in `worklog/WORKLOG.md`.
+32:
+33:## 4. Hugging Face login (from the Colab Secret)
+34:In a notebook cell (Colab kernel), so the token never touches a file:
+35:```
+36:from google.colab import userdata
+37:from huggingface_hub import login
+38:login(userdata.get("HF_TOKEN"))   # stored in the Colab VM's HF cache, outside the repo
+39:```
+40:In a plain terminal there is no Secrets access: export `HF_TOKEN` for that shell session only.
+41:
+42:## 5. Data
+43:First two files only:
+44:```
+45:hf download HuggingFaceFV/finevideo --repo-type dataset --include "data/train-0000[0-1]*" --local-dir /content/finevideo
+46:```
+47:Check `df -h`, then the full 50 files in the background:
+48:```
+49:nohup hf download HuggingFaceFV/finevideo --repo-type dataset --include "data/train-000[0-4]*" --local-dir /content/finevideo > /content/download.log 2>&1 &
+50:```
+51:The parquet files land in `/content/finevideo/data/`.
+52:
+53:## 6. Baseline on the subset (also produces the per-frame reference dump)
+54:```
+55:python run.py --input /content/finevideo/data --output reference/ref_subset.jsonl --limit-videos 64 --dump-frames reference/frames
+56:```
+57:`--limit-videos 64` keeps the run to roughly the first two files (sorted order) even while the full download is running.
+58:Record the stage timing line printed at the end (decode / infer / aggregate / total, frames/s) in the worklog.
+59:Colab disconnects: re-run the same command with `--resume` (it needs `reference/ref_subset.jsonl.done`, which sits next to the output).
+60:
+61:### Durable checkpoints (the Colab disk is wiped when the runtime resets)
+62:Try Google Drive first (may not work through the VS Code extension; confirm on the first session):
+63:```
+64:from google.colab import drive; drive.mount("/content/drive")      # in a notebook cell
+65:```
+66:Then add `--checkpoint-dir /content/drive/MyDrive/vidx-ckpt` to the run command (and point `--dump-frames` at a Drive folder too).
+67:If the mount does not work, create a private HF dataset repo (token with write access in `HF_TOKEN`, see step 4) and add `--checkpoint-hf-repo USER/REPO` instead; `--dump-frames` files are then uploaded to `<run-name>/frames/` in that repo.
+68:Use a different `--run-name` for each run (for example `ref_subset` and `full`).
+69:After a reset: redo steps 1-4, re-run the `hf download` commands from step 5 (they skip finished files), then repeat the same `run.py` command with `--resume`. A fresh run without `--resume` refuses to start when a checkpoint of that name exists.
+70:Elapsed time for HARDWARE.md: read `progress.json` from the newest checkpoint generation (`compute_s`, `wall_first_start`, `wall_last_end`, `sessions`). Time lost after the last snapshot of a crashed session is not counted.
+71:
+72:## 7. Checks (see plan "Verification")
+73:```
+74:python score.py reference/ref_subset.jsonl reference/ref_subset.jsonl     # expect 1.0 / 100% / 100%
+75:python tools/check_schema.py reference/ref_subset.jsonl
+76:python tools/find_rotated.py --input /content/finevideo/data --max-files 2
+77:python tools/decoder_agreement.py --input /content/finevideo/data --n 20
+78:python tools/batch_agreement.py --input /content/finevideo/data --frames 1000
+79:```
+80:Rotation: for a rotated clip found above, compare against `ffmpeg` autorotate (extract one frame with and without `-noautorotate`).
+  - Error text format: `could not decode video: <ExceptionType: message>` (truncated to 200 chars); zero decoded frames without an exception -> `no frames decoded`.
+  - `--limit-videos N` counts the first N videos in sorted file/row order, including ones skipped by `--resume`.
+  - The inference batch size is the whole `predict()` list; relies on Ultralytics treating a list of ndarrays as one batch.
+  - `prepare.py` downloads with `ultralytics.utils.downloads.attempt_download_asset(<abs path>)`, falling back to `YOLO("yolo11l.pt")` in the repo dir. Untested.
+  - Offline settings: `YOLO_OFFLINE=1`, `settings.update(sync=False)`, `YOLO_CONFIG_DIR` in the temp dir (set with `setdefault`). Untested; confirm with the offline check.
+  - `io.BytesIO(memoryview(buffer))` copies the mp4 bytes once per video (cheap relative to decode); `as_buffer()` itself does not copy.
+  - Stream-level rotation side data via `stream.side_data["DISPLAYMATRIX"]` is a guess about the PyAV API; it is wrapped in try/except and only a fallback after `frame.rotation`.
+  - `--resume` fsync is not done (flush only); a VM crash could lose the last video, which is simply redone because the sidecar is written after the output.
+- #4 (2026-11-19) RESOLVED: worklog is now committed in `worklog/`.
+- #7 (2026-11-19) Checkpoint assumptions (review, untested on Colab / the real HF Hub):
+  - `huggingface_hub==0.29.3` is believed to have `HfApi.upload_folder`, `delete_folder`, `list_repo_files`, `hf_hub_download(local_dir=)`; only a fake API object was tested. The repo must exist already (not auto-created).
+  - `--checkpoint-dir` stores under `DIR/<run-name>/gen-NNNN` (the plan said straight into DIR) so `--run-name` and the fresh-run guard work for folders too.
+  - HF `--dump-frames` files go to `<run-name>/frames/` in the same commit as the generation (never pruned), so old generations can be deleted without losing frames. Dump files are not restored automatically.
+  - Restore compares done-video counts: local wins ties; local counts only if output and sidecar both exist. A restore error (network, corrupt store) exits 2 rather than silently starting over.
+  - A checkpoint with a different fingerprint (input names/sizes, `--limit-videos`, output name) is refused (exit 2) even if older than local files.
+  - The final snapshot always makes a new generation, even if nothing changed. Time lost after a crashed session's last snapshot is not in `compute_s`.
+  - A half-written dump is only protected from partial reads, not cleaned up at start; `*.tmp.npz` files are ignored by the HF uploader.
+  - SIGTERM handler is `sys.exit(143)`, installed only with a checkpoint flag. Windows `.venv` runs Python 3.14, so the tests have not run on 3.11.
+
+## Deferred
+- #3 (2026-11-19) **Deferred, design noted.** TensorRT: L4 dev vs RTX 4090 grader, engine must be built in grader prep step. Rules recorded in CLAUDE.md "Inference backend". Baseline first with PyTorch .pt; model behind load_model()/infer(batch).
+
+## Closed issues
+- 2026-11-19 **Code review #1** (10 findings, all closed; 55 tests pass):
+  - R1 Inference failures were handled like decode failures. Fix: `run_inference` splits a batch in halves on CUDA OOM; other model errors raise `InferenceError`, the video is not written or marked done, and 3 in a row abort the run (exit 3, retry with `--resume`).
+  - R2 `YOLO_OFFLINE` was set to "1". Fix: now "True" (Ultralytics compares `value.lower() == "true"`).
+  - R3 A `--dump-frames` failure discarded the video's lines. Fix: the dump has its own try/except and only logs a warning.
+  - R4 `opencv-python-headless` clashed with the `opencv-python` that ultralytics pulls in. Fix: pinned `opencv-python==4.10.0.84` (numpy<2 compatible); SETUP.md wording updated. Still PROVISIONAL until verified (also supersedes #5's duplicate-wheel concern).
+  - R5 Leading frames without pts then a pts reset time to 0. Fix: `first_pts` is anchored so the first pts frame continues the estimated timeline.
+  - R6 No-rate fallback used absolute index/30. Fix: `last_t + step` (1/rate, else median of previous positive gaps, else 1/30; first frame 0).
+  - R7 `--resume` with an output but no `.done` sidecar silently wiped the output. Fix: `ResumeError` with a clear message (main exits 2).
+  - R8 All frame details were kept in memory. Fix: `process_frames(..., keep_details=)`; full records only with `--dump-frames`.
+  - R9 Two GPU transfers per result in `infer`. Fix: one `boxes.data.cpu()`, conf = column 4, cls = column 5.
+  - R10 `tools/batch_agreement.py` re-implemented batching. Fix: it calls `run.process_frames` with batch 1 vs `--batch`, plus a `classes=None` wrapper.
+- #1 (2026-11-19) The worklog used to be private; it is now committed in `worklog/`, so chat logs and the repo agree.
+- #4 (2026-11-19) Decision made: commit the worklog in `worklog/`.
+
+## Session log
+- 2026-11-19: Session "Alethia": repo setup.
+- 2026-11-19: Execution session (Sonnet): housekeeping + local code per the approved plan (steps 1-2). Colab steps not started.
+Activate.ps1
+activate
+activate.bat
