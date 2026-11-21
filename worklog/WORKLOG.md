@@ -52,6 +52,8 @@ Deadline: **Sun 22 Nov 2026, 23:55 PKT**
 - [ ] Final secret scan + push before deadline
 
 ## Completed
+- 2026-11-21: **6.6 re-run with the 54-pin requirements.txt (commit a3237a2):** fresh Python 3.11 venv, plain `pip install -r requirements.txt` → torch 2.6.0+cu126 (CUDA True), ultralytics 8.3.100, av 14.2.0; prepare.py "model OK on cuda:0"; 2-video run OK (1,547 fps). The freeze equals requirements.txt (54 pins, diffed). **The grader install path is verified.** bench_log.csv re-copied from Drive (34 runs incl. the threads 2/3/4 rows).
+  - **Code side complete.** Remaining: ai_chats/ (export + redaction, last), WRITEUP.md (user, no AI), final secret scan + push before Sun 22 Nov 23:55 PKT.
 - 2026-11-21: **uv vs pip with the 54 pins:** Colab cell 0.1 (`uv pip install`) failed with "no version of certifi==2026.11.20". uv uses the first index that has a package and checks the extra index (download.pytorch.org/whl/cu126) first. That index mirrors old versions of certifi, filelock, pillow, numpy, etc. Plain pip (the grader) merges all indexes and picks the best match, which is how 6.6 produced these exact versions. Fix: `--index-strategy unsafe-best-match` on every `uv pip install` (speedup.ipynb 0.1, baseline.ipynb, SETUP.md) plus a README note. requirements.txt unchanged. This also means the full run's venv (uv, direct pins only) took some transitive packages from the PyTorch index (older versions); results do not depend on them.
 - 2026-11-21: **Final checks (speedup.ipynb section 6, L4, commit 07122bc): all PASS.**
   - 6.1 OS **Ubuntu 24.04.4 LTS** (Colab container, kernel 6.6.159+); disk **NVMe SSD** (ROTA 0) → HARDWARE.md filled in.
