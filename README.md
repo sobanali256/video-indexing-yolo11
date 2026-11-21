@@ -54,7 +54,9 @@ sudo apt-get install -y python3.11 python3.11-venv   # only if Python 3.11 is no
 python3.11 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
-Already have a Python 3.11 environment? `pip install -r requirements.txt` in it is enough. The install needs ~5 GB of
+Already have a Python 3.11 environment? `pip install -r requirements.txt` in it is enough. Installing with `uv` instead of pip? Add
+`--index-strategy unsafe-best-match`: uv otherwise takes each package from the first index that has it (the PyTorch
+index mirrors old versions of e.g. `certifi`) and cannot resolve the pins; pip always picks the best match. The install needs ~5 GB of
 disk (PyTorch + CUDA wheels); torch 2.6.0 cu126 wheels run on any NVIDIA driver >= 525 (CUDA 12 minor-version compatibility).
 
 ## Prepare (untimed, needs internet)

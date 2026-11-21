@@ -29,7 +29,7 @@ pip install -q uv
 [ -d video-indexing-yolo11 ] || git clone https://github.com/sobanali256/video-indexing-yolo11.git
 cd video-indexing-yolo11 && git pull
 apt-get install -y -q libgl1 libglib2.0-0
-uv pip install --python /content/venv/bin/python -r requirements.txt
+uv pip install --index-strategy unsafe-best-match --python /content/venv/bin/python -r requirements.txt   # like pip: best version across all indexes (uv otherwise takes the first index that has a package)
 /content/venv/bin/python -c "import vidx,torch,av,ultralytics;print(torch.__version__,torch.cuda.is_available(),av.__version__,ultralytics.__version__)"
 /content/venv/bin/python prepare.py
 ```

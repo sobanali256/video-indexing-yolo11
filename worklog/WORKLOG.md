@@ -52,6 +52,7 @@ Deadline: **Sun 22 Nov 2026, 23:55 PKT**
 - [ ] Final secret scan + push before deadline
 
 ## Completed
+- 2026-11-21: **uv vs pip with the 54 pins:** Colab cell 0.1 (`uv pip install`) failed with "no version of certifi==2026.11.20". uv uses the first index that has a package and checks the extra index (download.pytorch.org/whl/cu126) first. That index mirrors old versions of certifi, filelock, pillow, numpy, etc. Plain pip (the grader) merges all indexes and picks the best match, which is how 6.6 produced these exact versions. Fix: `--index-strategy unsafe-best-match` on every `uv pip install` (speedup.ipynb 0.1, baseline.ipynb, SETUP.md) plus a README note. requirements.txt unchanged. This also means the full run's venv (uv, direct pins only) took some transitive packages from the PyTorch index (older versions); results do not depend on them.
 - 2026-11-21: **Final checks (speedup.ipynb section 6, L4, commit 07122bc): all PASS.**
   - 6.1 OS **Ubuntu 24.04.4 LTS** (Colab container, kernel 6.6.159+); disk **NVMe SSD** (ROTA 0) → HARDWARE.md filled in.
   - 6.2 decode threads 2 / 3 / 4 on tune: **byte-identical sorted output** (9,144 lines), all F1 0.9878 / exact 0.9588 / within1 0.9989. Speed 1,855 / 1,872 / 1,857 fps (L4 GPU-bound: no gain here; the gain is for faster GPUs, not measured on a 4090). `auto` (3 on 12 CPUs) is the default; performance-only change after results-v1, the 50 files were not re-run.
