@@ -7,9 +7,10 @@
 | GPU | NVIDIA L4, 23,034 MiB, driver 580.82.07 |
 | CPU | Intel Xeon @ 2.20 GHz, 12 vCPUs (1 socket, 2 threads per core) |
 | RAM | 52 GiB |
-| Disk | Colab local disk (`/content`); parquet files downloaded before the run (not timed) |
+| Operating system | Ubuntu 24.04.4 LTS (Colab runtime container, Linux kernel 6.6.159+) |
+| Disk | SSD: NVMe (`nvme0n1`, 250 GB, non-rotational); data on the local disk `/content`, parquet files downloaded before the run (not timed) |
 | Python | 3.11 (uv venv; the Colab kernel itself is 3.13) |
-| Packages | torch 2.6.0+cu126, ultralytics 8.3.100, av 14.2.0 (exact pins in `requirements.txt`) |
+| Packages | torch 2.6.0+cu126, ultralytics 8.3.100, av 14.2.0 (installed with `uv pip` from the direct pins; `requirements.txt` now pins all 54 packages from a clean plain-pip install, 2026-11-21) |
 
 ## What ran
 - Code: tag **`results-v1`** (commit `cfd9662`), `run.py` defaults: 3 sampled frames per second, FP16, 2 decode threads, batch 32.
@@ -34,3 +35,8 @@ The every-frame brute-force reference was not run on all 50 files. It was timed 
 2,447 s, 103.9 frames/s, nothing else on the GPU) and projected with the exact frame count of all 50 files
 (`tools/count_frames.py`): **124,936 s ≈ 34.7 h**. The full run above is **18.6x** faster.
 All measured runs are logged in `worklog/bench_log.csv`.
+
+## Changes after the full run (speed only, same results)
+`--decode-threads` now defaults to `auto` (one decode thread per 4 CPUs, 2 to 4; the full run used 2). On the tune file
+2, 3 and 4 threads give byte-identical output (9,144 lines) at 1,855 / 1,872 / 1,857 frames/s on the L4: the L4 is
+GPU-bound, so extra threads are meant for faster GPUs such as the RTX 4090. The 50 files were not re-run.

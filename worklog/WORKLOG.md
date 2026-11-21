@@ -52,6 +52,16 @@ Deadline: **Sun 22 Nov 2026, 23:55 PKT**
 - [ ] Final secret scan + push before deadline
 
 ## Completed
+- 2026-11-21: **Final checks (speedup.ipynb section 6, L4, commit 07122bc): all PASS.**
+  - 6.1 OS **Ubuntu 24.04.4 LTS** (Colab container, kernel 6.6.159+); disk **NVMe SSD** (ROTA 0) → HARDWARE.md filled in.
+  - 6.2 decode threads 2 / 3 / 4 on tune: **byte-identical sorted output** (9,144 lines), all F1 0.9878 / exact 0.9588 / within1 0.9989. Speed 1,855 / 1,872 / 1,857 fps (L4 GPU-bound: no gain here; the gain is for faster GPUs, not measured on a 4090). `auto` (3 on 12 CPUs) is the default; performance-only change after results-v1, the 50 files were not re-run.
+  - 6.3 rotation:
+    - 0 of 1,650 videos in the 50 files carry rotation metadata.
+    - On rotated copies of a real video (ffmpeg 6.1 `-display_rotation` 90/180/270), our decoder matches ffmpeg's autorotated first frame exactly: shape swapped as expected, mean difference 0.00. The angle arrives via `frame.rotation`; stream side data gave 0. **Rotation check closed.**
+  - 6.4 damaged inputs: exit 0. Valid videos have seconds; truncated and zeroed-block mp4 keep 73 / 101 seconds + 1 error line; random / null / empty mp4 and corrupt / truncated parquet give exactly 1 error line each. **Damaged-input check closed.**
+  - 6.5 offline: network namespace isolated (`unshare -n`), all sockets blocked, 0 connection attempts, exit 0, output identical to the online run (3 videos, 1,082 lines). **Offline check closed.**
+  - 6.6 clean install exactly as README: fresh 3.11 venv, plain `pip install -r requirements.txt` OK, `pip check` clean, prepare.py "model OK on cuda:0", 2-video run OK. The `pip freeze` (54 packages) now pins every package in requirements.txt (verified identical to the freeze). **The new file itself still needs one re-run of 6.6** (it now pins `torch==2.6.0+cu126` / `torchvision==0.21.0+cu126` from the cu126 index).
+  - TODO: re-copy `bench_log.csv` from Drive (3 new threads rows) into `worklog/` before the final push.
 - 2026-11-21: **Full review with 3 independent subagents** (brief compliance, code correctness, setup/offline). No code blockers; 180 tests pass. The direct path, timestamps, sampling, aggregation and threading were confirmed correct against the reference semantics; `YOLO_OFFLINE` is honoured in 8.3.100 and nothing downloads at run time.
   - Gaps found: HARDWARE.md lacks OS and disk type (brief asks for both); README lacked `apt-get update`, `git clone`/`cd`, the Python 3.11 / venv apt line and the driver note; requirements.txt had a stale PROVISIONAL note and pins only direct dependencies; rotation, offline and damaged-input checks were never run.
   - Decision items reported to the user: decode threads on the 4090 (likely decode-bound with 2), FP16 wording ("Ultralytics defaults"), exit 3 after 3 failed batches (kept).

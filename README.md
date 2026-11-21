@@ -78,7 +78,7 @@ before the error are kept and one error line is appended. One bad video never st
 |---|---|---|
 | `--sample K` | 3 | frames per second sent to the model; `0` = every frame (brute force) |
 | `--precision fp16\|fp32` | fp16 | model precision on the GPU |
-| `--decode-threads N` | auto | decode/letterbox threads overlapped with inference; `auto` = one per 4 CPUs, 2 to 4 (4 on a 32-thread machine); `0` = one video at a time through `predict()`. It changes speed only, not which frames are used |
+| `--decode-threads N` | auto | decode/letterbox threads overlapped with inference; `auto` = one per 4 CPUs, 2 to 4 (4 on a 32-thread machine); `0` = one video at a time through `predict()`. Speed only: 2, 3 and 4 threads give byte-identical output on the tune file |
 | `--batch B` | 32 | inference batch size (split in halves on CUDA out-of-memory) |
 | `--resume` | off | continue an interrupted run (uses `<output>.done`); refuses other `--sample`/`--precision` (`<output>.config.json`) |
 | `--limit-videos N` | all | only the first N videos |
